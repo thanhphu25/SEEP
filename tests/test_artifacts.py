@@ -24,7 +24,11 @@ def test_notebook_syntax_no_outputs_and_training_opt_in():
     for flag in ('RUN_SMOKE', 'RUN_PILOT', 'RUN_RESUME', 'RUN_EVALUATE', 'RUN_FULL'):
         assert f'{flag} = False' in source
     assert "'--seed', '--python', '3.9'" in source
-    assert "'scripts/verify_package.py'" in source
+    assert "REPO_URL = 'https://github.com/thanhphu25/SEEP.git'" in source
+    assert "BRANCH = 'ccsp-pilot'" in source
+    assert "'git', 'clone', '--depth', '1', '--single-branch', '--branch', BRANCH" in source
+    assert 'CODE_ZIP' not in source and 'extractall' not in source
+    assert 'verify_package.py' not in source  # A Git checkout is not an archive snapshot.
 
 
 def test_baseline_fixture_matches_audited_hash():

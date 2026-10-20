@@ -102,10 +102,18 @@ Token warm_up and scheduler warmup-epochs are distinct.
 ## Kaggle and exact commands
 
 Upload [SEEP_CCSP_Kaggle.ipynb](../notebooks/SEEP_CCSP_Kaggle.ipynb) as a Kaggle
-notebook. Upload `SEEP_CCSP_source.zip` as a Kaggle Dataset, add it and CUB as Inputs,
-then edit CODE_ZIP/DATA_PATH. ZIP has `main.py` directly at root and extracts into
-`/kaggle/working/SEEP_CCSP`. It excludes `.git`, datasets, weights, checkpoints,
-venvs and run outputs. Archive source hashes are verified by the notebook.
+notebook and add CUB as Input. Cell B clones
+`https://github.com/thanhphu25/SEEP.git`, branch `ccsp-pilot`, directly into
+`/kaggle/working/SEEP_CCSP`; edit only DATA_PATH for your CUB Input.
+The cell verifies repository/branch and prints the actual source commit.
+Rerunning it reuses the existing checkout without automatically pulling changes
+mid-run. To use a newer revision, start a fresh Kaggle session or choose a new
+PROJECT directory. No code Dataset/ZIP upload is needed.
+
+`SEEP_CCSP_source.zip` remains an optional source-only offline distribution with
+`main.py` at archive root. It excludes `.git`, datasets, weights, checkpoints,
+venvs and run outputs; `scripts/verify_package.py` verifies that archive snapshot,
+and is not required for the notebook's Git checkout workflow.
 
 The notebook creates Python3.9 via uv in a private venv, installs original pinned
 torch2.0.1/torchvision0.15.2/timm0.6.11 there, verifies GPU, runs toy tests and checks

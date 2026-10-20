@@ -15,10 +15,10 @@ def main():
     markdown('''# SEEP / Image Gate / CCSP — Kaggle
 
 Bạn là người chạy train. Notebook này chưa được chạy trên GPU/CUB thật.
-Source dựa trên SEEP commit `80081081ab42769d102f83d447705da0639e2fb1`, nhánh local `ccsp-pilot`.
+Source dựa trên SEEP commit `80081081ab42769d102f83d447705da0639e2fb1`, nhánh `ccsp-pilot` của `thanhphu25/SEEP`.
 Không có kết quả CCSP hay khẳng định cải thiện/novelty.
 
-1. Upload `SEEP_CCSP_source.zip` thành Kaggle Dataset, rồi **Add Input** cùng CUB-200.
+1. Import notebook này lên Kaggle, rồi **Add Input** dataset CUB-200. Cell B clone source trực tiếp từ GitHub.
 2. Bật **GPU** và Internet để tạo venv/tải dependencies và pretrained weights; có thể dùng weights local.
 3. Chạy A → F (setup + tests), sau đó chủ động chạy một method ở G.
 4. Smoke kiểm tra kỹ thuật; pilot dùng dev 10%; không dùng official test để chọn cấu hình.
@@ -41,18 +41,27 @@ subprocess.run([PYTHON, '-c', "import sys; print(sys.version); assert sys.versio
 # Ensure pip exists also when reusing a venv created without --seed.
 subprocess.run([sys.executable, '-m', 'uv', 'pip', 'install', '--python', PYTHON, 'pip'], check=True)
 ''')
-    markdown('## B. Giải nén source đã sửa\nSửa `CODE_ZIP` theo Input của bạn. ZIP có `main.py` ngay root; không clone repo gốc để gọi flags mới.')
-    code('''import zipfile
-CODE_ZIP = Path('/kaggle/input/your-ccsp-code/SEEP_CCSP_source.zip')
+    markdown('''## B. Clone source từ GitHub
+Repo: https://github.com/thanhphu25/SEEP/tree/ccsp-pilot
+
+Cell clone đúng nhánh `ccsp-pilot` vào Kaggle Working và in commit thực tế.
+Chạy lại cell sẽ dùng checkout hiện có sau khi xác nhận repo/nhánh; không tự pull giữa một run.
+''')
+    code('''REPO_URL = 'https://github.com/thanhphu25/SEEP.git'
+BRANCH = 'ccsp-pilot'
 PROJECT = Path('/kaggle/working/SEEP_CCSP')
-assert CODE_ZIP.is_file(), 'Sửa CODE_ZIP theo Kaggle Input đã upload.'
-PROJECT.mkdir(parents=True, exist_ok=True)
-with zipfile.ZipFile(CODE_ZIP) as archive:
-    for name in archive.namelist():
-        (PROJECT / name).resolve().relative_to(PROJECT.resolve())
-    archive.extractall(PROJECT)
-assert (PROJECT / 'main.py').is_file()
-print((PROJECT / 'source_metadata.json').read_text())
+if not PROJECT.exists():
+    subprocess.run(['git', 'clone', '--depth', '1', '--single-branch', '--branch', BRANCH,
+                    REPO_URL, str(PROJECT)], check=True)
+assert (PROJECT / '.git').is_dir(), f'{PROJECT} đã tồn tại nhưng không phải Git checkout; dùng PROJECT khác.'
+origin = subprocess.check_output(['git', '-C', str(PROJECT), 'remote', 'get-url', 'origin'], text=True).strip()
+branch = subprocess.check_output(['git', '-C', str(PROJECT), 'branch', '--show-current'], text=True).strip()
+assert origin.removesuffix('.git') == REPO_URL.removesuffix('.git'), f'Sai repository: {origin}'
+assert branch == BRANCH, f'Sai branch: {branch}'
+for relative in ('main.py', 'modules/spatial_gate.py', 'scripts/launch.py', 'requirements-test.txt'):
+    assert (PROJECT / relative).is_file(), f'Branch thiếu implementation: {relative}'
+SOURCE_COMMIT = subprocess.check_output(['git', '-C', str(PROJECT), 'rev-parse', 'HEAD'], text=True).strip()
+print(f'Source: {origin} | branch: {branch} | commit: {SOURCE_COMMIT}')
 ''')
     markdown('## C. Dependencies và GPU\nTorch cũ chỉ được cài trong venv, không thay torch của kernel Kaggle. Khi tái dùng venv, cell vẫn xác nhận versions.')
     code('''subprocess.run([sys.executable, '-m', 'uv', 'pip', 'install', '--python', PYTHON,
@@ -65,8 +74,7 @@ subprocess.run([PYTHON, '-c',
     "assert timm.__version__=='0.6.11'"], check=True)
 ''')
     markdown('## D. Invariant tests trên toy data\nCó vài bước optimizer trên mô hình ViT nhỏ để kiểm tra gradient/resume; không train CUB hoặc tải weights. Tests CPU không thay thế GPU smoke.')
-    code('''subprocess.run([PYTHON, 'scripts/verify_package.py'], cwd=PROJECT, check=True)
-subprocess.run([PYTHON, '-m', 'pytest', 'tests', '-q',
+    code('''subprocess.run([PYTHON, '-m', 'pytest', 'tests', '-q',
                 '--basetemp=/kaggle/working/ccsp-test-tmp'], cwd=PROJECT, check=True)
 ''')
     markdown('''## E. Dataset và lệnh chung
