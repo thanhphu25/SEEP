@@ -50,8 +50,15 @@ def initialize_experiment(seed=None):
         seed = random.randint(1, 100000)
     set_seed(seed)
     save_seed(seed)
+    return seed
 
 def main(args):
+    import copy
+    import json
+    from modules.checkpoint import (initialize_local_weights, source_metadata, load_trusted,
+                                    validate_checkpoint, canonical_config, evaluation_task, evaluation_history)
+    from modules.spatial_gate import attach_research_modules
+    args.requested_config = copy.deepcopy(vars(args))
     
     log_dir = os.path.join('./logs')
     if not os.path.exists(log_dir):
@@ -63,9 +70,17 @@ def main(args):
     args_str = ', '.join(f'{k}={v}' for k, v in vars(args).items())
     logger.info(f'Parsed arguments: {args_str}')
     
-    initialize_experiment(seed=args.seed)
+    if args.seed == 0 and (args.resume or args.eval_checkpoint):
+        saved = load_trusted(args.resume or args.eval_checkpoint)
+        args.seed = saved.get('seed', getattr(saved.get('args'), 'seed', 0))
+        if not args.seed:
+            raise ValueError('Checkpoint has no actual seed; supply the original nonzero --seed')
+    args.seed = initialize_experiment(seed=args.seed)
+    args.source_metadata = source_metadata()
     
     utils.init_distributed_mode(args)
+    if args.distributed:
+        raise ValueError('This research runner currently requires one process/GPU (prototype/RNG lifecycle)')
 
     device = torch.device(args.device)
     cudnn.benchmark = True
@@ -73,10 +88,16 @@ def main(args):
     data_loader, class_mask = build_continual_dataloader(args)
     # logger.info(f'Class Mask: {class_mask}')
 
+    restoring_full = False
+    if args.resume or args.eval_checkpoint:
+        saved = load_trusted(args.resume or args.eval_checkpoint)
+        restoring_full = 'reference_model' in saved
+        del saved
+
     print(f"Creating original model: {args.model}")
     original_model = create_model(
         args.model,
-        pretrained=args.pretrained,
+        pretrained=args.pretrained and not args.pretrained_checkpoint and not restoring_full,
         num_classes=args.nb_classes,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
@@ -86,7 +107,7 @@ def main(args):
     print(f"Creating model: {args.model}")
     model = create_model(
         args.model,
-        pretrained=args.pretrained,
+        pretrained=args.pretrained and not args.pretrained_checkpoint and not restoring_full,
         num_classes=args.nb_classes,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
@@ -120,8 +141,14 @@ def main(args):
         D2=args.D2,
         args=args
     )
+    if not restoring_full:
+        initialize_local_weights(original_model, model, args.pretrained_checkpoint)
+    attach_research_modules(model, args)
     original_model.to(device)
-    model.to(device) 
+    model.to(device)
+    original_model.eval()
+    for parameter in original_model.parameters():
+        parameter.requires_grad_(False)
 
 
     if args.freeze:
@@ -135,19 +162,48 @@ def main(args):
                 p.requires_grad = False
     
 
-    if args.eval:
-        acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
+    args.class_order = [list(scope) for scope in class_mask] if class_mask else None
+    args.requested_lr = args.lr
+    if args.unscale_lr:
+        global_batch_size = args.batch_size
+    else:
+        global_batch_size = args.batch_size * args.world_size
+    args.lr = args.requested_lr * global_batch_size / 256.0
+    args.resolved_config = copy.deepcopy(canonical_config(args))
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    manifest = output_path / 'run_config.json'
+    if (manifest.exists() or any((output_path / 'checkpoint').glob('*.pth'))) and not (args.resume or args.eval or args.eval_checkpoint):
+        raise ValueError('output_dir already contains a run; choose a new directory or explicit --resume')
+    if args.resume:
+        validate_checkpoint(load_trusted(args.resume), args)
+    if not (args.eval or args.eval_checkpoint):
+        manifest.write_text(json.dumps({'requested': args.requested_config, 'resolved': vars(args)},
+                                      indent=2, default=str), encoding='utf-8')
 
-        for task_id in range(args.num_tasks):
+    if args.eval or args.eval_checkpoint:
+        acc_matrix = np.full((args.num_tasks, args.num_tasks), np.nan)
+        tasks = range(args.num_tasks_to_run or args.num_tasks)
+        if args.eval_checkpoint:
+            checkpoint = load_trusted(args.eval_checkpoint)
+            tasks = [evaluation_task(checkpoint, args.eval_checkpoint, args)]
+        for task_id in tasks:
             checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
+            if args.eval_checkpoint:
+                checkpoint_path = args.eval_checkpoint
             if os.path.exists(checkpoint_path):
                 print('Loading checkpoint from:', checkpoint_path)
-                checkpoint = torch.load(checkpoint_path)
+                checkpoint = load_trusted(checkpoint_path)
+                validate_checkpoint(checkpoint, args, evaluation=True)
                 _prepare_dynamic_buffers_for_checkpoint(model, checkpoint['model'])
-                model.load_state_dict(checkpoint['model'])
+                model.load_state_dict(checkpoint['model'], strict=True)
+                if 'reference_model' in checkpoint:
+                    original_model.load_state_dict(checkpoint['reference_model'], strict=True)
+                if args.eval_checkpoint:
+                    acc_matrix = evaluation_history(checkpoint, args)
             else:
                 print('No checkpoint found at:', checkpoint_path)
-                return
+                raise FileNotFoundError(checkpoint_path)
             _ = evaluate_till_now(model, original_model, data_loader, device, 
                                             task_id, class_mask, acc_matrix, args,)
         
@@ -176,18 +232,7 @@ def main(args):
     logger.info(n_parameters)
     
     
-    if args.unscale_lr:
-        global_batch_size = args.batch_size
-    else:
-        global_batch_size = args.batch_size * args.world_size
-    args.lr = args.lr * global_batch_size / 256.0
-
-    optimizer = create_optimizer(args, model_without_ddp)
-
-    if args.sched != 'constant':
-        lr_scheduler, _ = create_scheduler(args, optimizer)
-    elif args.sched == 'constant':
-        lr_scheduler = None
+    optimizer, lr_scheduler = None, None  # Built after current dynamic generator exists.
 
     criterion = torch.nn.CrossEntropyLoss().to(device)
 
@@ -203,62 +248,9 @@ def main(args):
     logger.info(f"Total training time: {total_time_str}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('SEEP training and evaluation configs')
-    
-    config = parser.parse_known_args()[-1][0]
-
-    subparser = parser.add_subparsers(dest='subparser_name')
-
-    if config == 'cifar100_10task':
-        from configs.cifar100_10task import get_args_parser
-        config_parser = subparser.add_parser('cifar100_10task', help='10-Split-CIFAR100 configs')
-    elif config == 'cifar100_20task':
-        from configs.cifar100_20task import get_args_parser
-        config_parser = subparser.add_parser('cifar100_20task', help='20-Split-CIFAR100 configs')
-    elif config == 'imr_10task':
-        from configs.imr_10task import get_args_parser
-        config_parser = subparser.add_parser('imr_10task', help='10-Split-ImageNet-R configs')
-    elif config == 'imr_20task':
-        from configs.imr_20task import get_args_parser
-        config_parser = subparser.add_parser('imr_20task', help='20-Split-ImageNet-R configs')
-    elif config == 'cub200_10task':
-        from configs.cub200_10task import get_args_parser
-        config_parser = subparser.add_parser('cub200_10task', help='10-Split-CUB200 configs')
-    elif config == 'cub200_20task':
-        from configs.cub200_20task import get_args_parser
-        config_parser = subparser.add_parser('cub200_20task', help='20-Split-CUB200 configs')
-    elif config == 'ucf101_10task':
-        from configs.ucf101_10task import get_args_parser
-        config_parser = subparser.add_parser('ucf101_10task', help='10-Split-UCF101 configs')
-    elif config == 'ucf101_20task':
-        from configs.ucf101_20task import get_args_parser
-        config_parser = subparser.add_parser('ucf101_20task', help='20-Split-UCF101 configs')
-    elif config == 'activitynet_10task':
-        from configs.activitynet_10task import get_args_parser
-        config_parser = subparser.add_parser('activitynet_10task', help='10-Split-ActivityNet configs')
-    elif config == 'activitynet_20task':
-        from configs.activitynet_20task import get_args_parser
-        config_parser = subparser.add_parser('activitynet_20task', help='20-Split-ActivityNet configs')
+    from modules.arguments import parse_args
+    args = parse_args()
+    if args.parse_only:
+        print(vars(args))
     else:
-        raise NotImplementedError
-        
-    get_args_parser(config_parser)
-
-    args = parser.parse_args()
-    
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    
-    main(args)
-    
-    sys.exit(0)
-    
-
-
-
-
-
-
-
-
- 
+        main(args)

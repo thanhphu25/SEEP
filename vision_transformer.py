@@ -742,7 +742,34 @@ class VisionTransformer(nn.Module):
         ifft_residual = torch.fft.ifftn(ifft_residual, dim=(-2, -1))
         return input + (torch.abs(ifft_residual) - input) * self.frequency_residual_scale
 
-    def forward_features(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None):
+    def regulate_local(self, x, prompts, cls_features, raw_patches):
+        mode = getattr(self.args, 'gate_mode', 'learned')
+        method = getattr(self.args, 'method', 'seep')
+        if mode == 'zero':
+            return prompts * 0
+        if mode == 'identity' or method == 'seep':
+            return prompts
+        from modules.spatial_gate import image_descriptor, tensor_stats
+        if cls_features is None or raw_patches is None:
+            raise ValueError('Learned gate needs raw CLS and patches from one reference forward')
+        if method == 'ccsp':
+            context, scalars, candidates = self.reference_bank.describe(
+                cls_features, self.args.reference_topk, self.args.reference_temperature)
+            self._candidate_ids = candidates
+        else:
+            context, scalars = image_descriptor(cls_features, raw_patches)
+        patch_h, patch_w = self.patch_embed.patch_size
+        grid = (x.shape[-2] // patch_h, x.shape[-1] // patch_w)
+        mask, amplitude, spatial = self.spatial_gate(
+            cls_features, raw_patches, context, scalars, grid, x.shape[-2:])
+        scale = self.alpha if hasattr(self, 'alpha') else 1.
+        self._gate_diagnostics = {
+            **tensor_stats('a', amplitude), **tensor_stats('S', spatial), **tensor_stats('M', mask),
+            'local_norm': prompts.detach().flatten(1).norm(dim=1).mean().item(),
+            'actual_local_norm': (scale * mask * prompts).detach().flatten(1).norm(dim=1).mean().item()}
+        return mask * prompts
+
+    def forward_features(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None, raw_patches=None):
 
         if train:
             if epoch_info >= self.warmup:
@@ -763,13 +790,13 @@ class VisionTransformer(nn.Module):
             if lgsp_type == 'LGSP':
                 res = self.get_prompts(x, task_id=learned_id, train=train)  
                 prompts = res['prompts']
-                input1 = x + prompts * 1
+                input1 = x + self.regulate_local(x, prompts, cls_features, raw_patches) * 1
                 input2 = self.get_Frequency_mask(x)
                 x = self.alpha * input1 + self.beta * input2
             elif lgsp_type == 'LSP':
                 res = self.get_prompts(x, task_id=learned_id, train=train)  
                 prompts = res['prompts']
-                x = x + prompts * 1
+                x = x + self.regulate_local(x, prompts, cls_features, raw_patches) * 1
             elif lgsp_type == 'GSP':
                 x = self.get_Frequency_mask(x)  
 
@@ -825,17 +852,29 @@ class VisionTransformer(nn.Module):
         
         return res
 
-    def forward(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None):
-        if not train and cls_features is not None:
-            matched_task_id = self.match_task_rainbow_style(cls_features, learned_id)
+    def forward(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None,
+                raw_patches=None, forced_task_id=None):
+        self._gate_diagnostics = {}
+        self._candidate_ids = None
+        if forced_task_id is not None and train:
+            raise ValueError('Forced routes are evaluation-only')
+        if not train and cls_features is not None and hasattr(self, 'rainbow_prompt'):
+            matched_task_id = (int(forced_task_id) if forced_task_id is not None
+                               else self.match_task_rainbow_style(cls_features, learned_id))
+            if not 0 <= matched_task_id <= learned_id:
+                raise ValueError('Forced route is outside learned tasks')
             self.matched_task_id = matched_task_id
             self.rainbow_prompt.task_id = matched_task_id
         else:
             # During training, use provided task_id
             self.matched_task_id = task_id
         
-        res = self.forward_features(x, task_id=task_id, learned_id=learned_id, cls_features=cls_features, train=train, epoch_info=epoch_info)
+        res = self.forward_features(x, task_id=task_id, learned_id=learned_id, cls_features=cls_features,
+                                    train=train, epoch_info=epoch_info, raw_patches=raw_patches)
         res = self.forward_head(res)
+        res['diagnostics'] = self._gate_diagnostics
+        if self._candidate_ids is not None:
+            res['candidate_ids'] = self._candidate_ids
         return res
 
 

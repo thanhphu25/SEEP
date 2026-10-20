@@ -1,3 +1,11 @@
+# CCSP pilot implementation
+
+The local `ccsp-pilot` work adds SEEP / image-only gate / CCSP controls and an
+unexecuted [Kaggle notebook](notebooks/SEEP_CCSP_Kaggle.ipynb).
+See [audit](docs/baseline_audit.md), [training/evaluation/resume instructions](docs/ccsp_implementation.md)
+and [checks actually run](docs/validation.md). Real-data training is left to the user;
+no CCSP accuracy improvement is claimed.
+
 ## Spatially Enhanced Evolutionary Prompting for Class-Incremental Learning [ICONIP 2026]
 
 ![SEEP Overview](./Overview.png)

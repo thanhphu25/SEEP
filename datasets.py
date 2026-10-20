@@ -8,6 +8,7 @@
 # ------------------------------------------
 
 import random
+import copy
 
 import torch
 from torch.utils.data.dataset import Subset
@@ -16,7 +17,6 @@ from torchvision import datasets, transforms
 from timm.data import create_transform
 from PIL import Image, ImageFilter, ImageOps
 from continual_datasets.continual_datasets import *
-from continual_datasets.video_datasets import UCF101, ActivityNet
 
 import utils
 
@@ -47,6 +47,12 @@ def collate_video(batch):
     return torch.stack(videos, dim=0), torch.as_tensor(labels, dtype=torch.long)
 
 def build_continual_dataloader(args):
+    # Video dependencies (decord) are not needed for the CUB image experiments.
+    if any(name in args.dataset for name in ('UCF101', 'ActivityNet')):
+        from continual_datasets.video_datasets import UCF101, ActivityNet
+        video_types = (ActivityNet, UCF101)
+    else:
+        video_types = ()
     dataloader = list()
     class_mask = list() if args.task_inc or args.train_mask else None
 
@@ -57,6 +63,22 @@ def build_continual_dataloader(args):
         dataset_train, dataset_val = get_dataset(args.dataset.replace('Split-',''), transform_train, transform_val, args)
 
         args.nb_classes = len(dataset_val.classes)
+
+        from modules.splits import stratified_indices
+        ids = getattr(dataset_train, 'sample_ids', list(map(str, range(len(dataset_train)))))
+        train_indices, dev_indices = stratified_indices(dataset_train.targets, args.dev_fraction, args.split_seed)
+        args.split_ids = {'train': [ids[i] for i in train_indices], 'dev': [ids[i] for i in dev_indices]}
+        if args.dev_fraction:
+            eval_train = copy.copy(dataset_train)
+            eval_train.transform = transform_val
+            train_base = dataset_train
+            dataset_train = Subset(train_base, train_indices)
+            dataset_train.classes = train_base.classes
+            dataset_train.targets = [train_base.targets[i] for i in train_indices]
+            if args.eval_split == 'dev':
+                dataset_val = Subset(eval_train, dev_indices)
+                dataset_val.classes = eval_train.classes
+                dataset_val.targets = [eval_train.targets[i] for i in dev_indices]
 
         splited_dataset, class_mask = split_single_dataset(dataset_train, dataset_val, args)
     else:
@@ -102,7 +124,7 @@ def build_continual_dataloader(args):
 
         base_train = _unwrap_to_base_dataset(dataset_train)
         video_collate = (
-            collate_video if (isinstance(base_train, ActivityNet) or isinstance(base_train, UCF101)) else None
+            collate_video if isinstance(base_train, video_types) else None
         )
         
         # Flattening (B, S, C, H, W) -> (B*S, C, H, W) multiplies per-step activations by S; keep the
@@ -143,7 +165,11 @@ def build_continual_dataloader(args):
             collate_fn=video_collate,
         )
 
-        dataloader.append({'train': data_loader_train, 'val': data_loader_val, 'mem': data_loader_mem})
+        entry = {'train': data_loader_train, 'val': data_loader_val, 'mem': data_loader_mem}
+        if args.method == 'ccsp':
+            from modules.splits import prototype_loader
+            entry['prototype'] = prototype_loader(dataset_train, transform_val, args, i)
+        dataloader.append(entry)
 
     return dataloader, class_mask
 
@@ -181,8 +207,9 @@ def get_dataset(dataset, transform_train, transform_val, args,):
         dataset_val = StanfordCars(args.data_path, split='test', download=True, transform=transform_val)
         
     elif dataset == 'CUB200':
-        dataset_train = CUB200(args.data_path, train=True, download=True, transform=transform_train).data
-        dataset_val = CUB200(args.data_path, train=False, download=True, transform=transform_val).data
+        from modules.cub import ReadOnlyCUB
+        dataset_train = ReadOnlyCUB(args.data_path, train=True, transform=transform_train)
+        dataset_val = ReadOnlyCUB(args.data_path, train=False, transform=transform_val)
     
     elif dataset == 'Scene67':
         dataset_train = Scene67(args.data_path, train=True, download=True, transform=transform_train).data
@@ -197,10 +224,12 @@ def get_dataset(dataset, transform_train, transform_val, args,):
         dataset_val = Imagenet_R(args.data_path, train=False, download=True, transform=transform_val).data
     
     elif dataset == 'UCF101':
+        from continual_datasets.video_datasets import UCF101
         dataset_train = UCF101(args.data_path, train=True, num_tasks = args.num_tasks, transform=transform_train)
         dataset_val   = UCF101(args.data_path, train=False, num_tasks = args.num_tasks, transform=transform_val)
  
     elif dataset == 'ActivityNet':
+        from continual_datasets.video_datasets import ActivityNet
         dataset_train = ActivityNet(args.data_path, train=True, num_tasks = args.num_tasks, transform=transform_train)
         dataset_val   = ActivityNet(args.data_path, train=False, num_tasks = args.num_tasks, transform=transform_val)
 

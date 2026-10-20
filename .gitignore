@@ -1,2 +1,10 @@
 __pycache__
 logs/*
+.venv/
+.python/
+.uv-cache/
+.pytest_cache/
+pytest-cache-files-*/
+.test-tmp*/
+runs/
+*.zip
