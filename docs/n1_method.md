@@ -113,6 +113,10 @@ boundary. Reference pretrained initialization is recreated using the same seed
 and cache; it is not a per-task new encoder. Source/environment changes during
 resume are explicitly reported in resume_audit.json.
 
+The launcher supports fresh runs with --config cub200_10task/cub200_20task using
+repository defaults and a new positive seed, without a historical checkpoint.
+The optional --baseline-checkpoint path imports a prior run's args only.
+Fresh-run LR is already pre-scaling and is not divided by a baseline scale.
 The launcher enables these checkpoint/metrics facilities for off as well. Direct
 legacy main with mode=off retains its old checkpoint/resume path. N1 adds no
 inference component or unseen-class mask. Raw evaluation is the baseline

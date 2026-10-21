@@ -160,3 +160,38 @@ def test_dry_run_no_training_imports_or_weights(tmp_path, data_root, monkeypatch
     monkeypatch.setattr(builtins, '__import__', guarded)
     cli(['--baseline-checkpoint', str(path), '--seed', '23', '--data-path', str(data_root),
          '--output-dir', str(tmp_path / 'dry'), '--srm-mode', 'semantic_full', '--dry-run'])
+
+
+@pytest.mark.parametrize('tasks', [10, 20])
+def test_fresh_run_uses_repo_defaults_without_loading_any_checkpoint(tmp_path, data_root, monkeypatch, tasks):
+    import scripts.run_cub_n1 as launcher
+    def fail(*a, **kw):
+        pytest.fail('Fresh run tried to read an old checkpoint')
+    monkeypatch.setattr(launcher, 'trusted_load', fail)
+    opt = get_parser().parse_args(['--config', f'cub200_{tasks}task', '--seed', '3407',
+                                  '--data-path', str(data_root), '--output-dir', str(tmp_path / 'fresh'),
+                                  '--srm-mode', 'semantic_full', '--dry-run'])
+    args = prepare(opt)
+    defaults = cub_args(tasks)
+    assert args.num_tasks == tasks and args.seed == 3407
+    for key in ('batch_size', 'num_r', 'model', 'epochs', 'pretrained', 'lr', 'lr_local',
+                'lr_Frequency_mask', 'num_workers', 'pin_mem', 'freeze', 'opt_betas'):
+        assert getattr(args, key) == getattr(defaults, key)
+        assert type(getattr(args, key)) is type(getattr(defaults, key))
+    report = json.loads((tmp_path / 'fresh' / 'effective_config.json').read_text())
+    assert report['baseline_checkpoint'] is None and report['config_source'] == 'repo_defaults'
+    assert report['learning_rates']['pre_scaling'] == .03
+    assert report['learning_rates']['effective'] == pytest.approx(.00375)
+    assert report['provenance']['status'] == 'fresh_run_repo_defaults'
+    assert 'log' not in report['seed']['confirmation']
+    assert args.num_tasks_to_run == 0
+    assert prepare(opt).lr == .03  # rerun preflight does not scale again
+    opt.seed = 0
+    with pytest.raises(ValueError, match='reproducible fresh run'):
+        prepare(opt)
+
+
+def test_config_sources_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        get_parser().parse_args(['--config', 'cub200_10task', '--baseline-checkpoint', 'old.pth',
+                                 '--seed', '7', '--data-path', 'data', '--output-dir', 'out'])

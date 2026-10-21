@@ -38,3 +38,18 @@ profiling, Kaggle notebook execution, raw-data symlink execution on Linux.
 The runtime records actual collector time/CUDA peak/gradient statistics when
 the user runs it. These synthetic checks are not evidence of N1 accuracy,
 novelty, a tuned lambda or improved forgetting. Dependency versions were not changed.
+
+## Fresh-run launcher follow-up (2026-10-22)
+
+User requested a new independent run without an old baseline artifact. Added
+--config cub200_10task/cub200_20task, mutually exclusive with the optional
+--baseline-checkpoint path. Fresh runs use repo research defaults, accept a new
+positive seed and retain pre-scaling LR=.03. No historical checkpoint is read.
+Kaggle guide/notebook now contain five fresh-start cells, including explicit
+installation into a separate Python 3.10/Torch 2.0.1 CUDA 11.8 environment.
+
+Full suite: **38 passed in 16.66s**. Fresh-mode tests reject checkpoint reads,
+verify defaults/types/LR/seed/reporting for CUB10/20 and repeated dry-run. The five
+notebook cells parse as Python. The original parity/resume tests still pass.
+The new Linux/CUDA environment installation and full Kaggle training remain
+unexecuted locally; no local dependency installation or full training was done.

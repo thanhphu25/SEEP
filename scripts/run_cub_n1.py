@@ -1,4 +1,4 @@
-"""Kaggle preflight/launcher. Baseline checkpoint supplies configuration, never weights."""
+"""Kaggle launcher: fresh repo config or optional trusted baseline configuration."""
 import argparse
 import gc
 import importlib
@@ -97,7 +97,21 @@ def baseline_configuration(path, supplied_seed):
 
 
 def prepare(options):
-    baseline, meta = baseline_configuration(options.baseline_checkpoint, options.seed)
+    fresh = options.config is not None
+    if fresh:
+        if options.seed <= 0:
+            raise ValueError('--seed must be >0 for a reproducible fresh run')
+        config_parser = argparse.ArgumentParser()
+        importlib.import_module('configs.' + options.config).get_args_parser(config_parser)
+        baseline = vars(config_parser.parse_args([]))
+        baseline['subparser_name'] = options.config
+        scale = baseline['batch_size'] / 256.0  # fresh single-GPU repo defaults
+        meta = dict(lr=dict(pre_scaling=baseline['lr'], effective=baseline['lr'] * scale,
+                            scale=scale, lr_local=baseline['lr_local'],
+                            lr_Frequency_mask=baseline['lr_Frequency_mask']),
+                    resolved_seed=None)
+    else:
+        baseline, meta = baseline_configuration(options.baseline_checkpoint, options.seed)
     values = baseline.copy()
     updates = dict(data_path=str(Path(options.data_path).resolve()),
                    output_dir=str(Path(options.output_dir).resolve()),
@@ -137,28 +151,36 @@ def prepare(options):
     old_git = meta.get('git')
     old_commit = (old_git.get('commit') if isinstance(old_git, dict) else old_git) or meta.get('git_commit') or meta.get('source_commit')
     provenance = dict(baseline_commit=old_commit, current=current_git,
-                      status='unknown' if not old_commit else
+                      status='fresh_run_repo_defaults' if fresh else 'unknown' if not old_commit else
                       'same_commit' if old_commit == current_git['commit'] else 'different_commit',
                       baseline_environment=meta.get('environment'),
-                      note='Audited base is not proof of the historical notebook source or patches')
+                      note='Fresh experiment from repo defaults; no historical baseline comparison asserted' if fresh
+                      else 'Audited base is not proof of the historical notebook source or patches')
     report = dict(args=vars(args), run_identity=run_identity(args), learning_rates=meta['lr'],
-                  seed=dict(value=options.seed, confirmation='user-confirmed baseline log seed; log not inspected',
-                            checkpoint_seed=baseline['seed'], checkpoint_resolved_seed=meta['resolved_seed']),
-                  baseline_checkpoint=str(Path(options.baseline_checkpoint).resolve()),
+                  config_source='repo_defaults' if fresh else 'baseline_checkpoint_args',
+                  seed=dict(value=options.seed, confirmation='user-selected fresh experiment seed' if fresh
+                            else 'user-confirmed baseline log seed; log not inspected',
+                            checkpoint_seed=None if fresh else baseline['seed'], checkpoint_resolved_seed=meta['resolved_seed']),
+                  baseline_checkpoint=None if fresh else str(Path(options.baseline_checkpoint).resolve()),
                   provenance=provenance, environment=environment_audit(), dataset=data,
-                  initialization='same pretrained initialization; baseline weights are NOT loaded',
+                  initialization='fresh pretrained initialization; no baseline checkpoint' if fresh
+                  else 'same pretrained initialization; baseline weights are NOT loaded',
                   resume='latest complete task boundary only; interrupted task restarts')
     write_json(output / 'effective_config.json', report)
     write_json(output / 'config_diff.json', diff)
     print(f'Preflight OK: {args.subparser_name}, mode={args.srm_mode}, seed={args.seed}')
     print(f'LR pre={args.lr}, effective={meta["lr"]["effective"]}; local/frequency LRs unchanged')
-    print(f'Baseline source provenance: {provenance["status"]}. Review {output / "effective_config.json"}')
+    print(f'Config source: {report["config_source"]}; provenance: {provenance["status"]}. '
+          f'Review {output / "effective_config.json"}')
     return args
 
 
 def get_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline-checkpoint', required=True, help='Your own trusted baseline .pth')
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--config', choices=('cub200_10task', 'cub200_20task'),
+                        help='Fresh experiment from repository defaults; no old checkpoint needed')
+    source.add_argument('--baseline-checkpoint', help='Optional: reuse args from your trusted baseline .pth')
     parser.add_argument('--seed', required=True, type=int)
     parser.add_argument('--data-path', required=True)
     parser.add_argument('--output-dir', required=True)

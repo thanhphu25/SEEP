@@ -95,3 +95,7 @@ strict checkpoint load, and guards CUDA synchronization on CPU test hosts.
 These are import/I/O/checkpoint support changes, not changes to LGSP, transforms,
 RainbowPrompt or evaluation math. See n1_method.md for tensor-byte accounting
 and n1_kaggle.md for checks performed and hardware limitations.
+
+Follow-up: fresh-run --config support uses these audited repo defaults and does
+not require the historical checkpoint/log/notebook. Those artifacts are only
+needed if a user specifically wants to match the earlier baseline experiment.
