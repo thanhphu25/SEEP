@@ -427,6 +427,16 @@ class CUB200(torch.utils.data.Dataset):
         self.url = 'https://data.deepai.org/CUB200(2011).zip'
         self.filename = 'CUB200(2011).zip'
 
+        # Prepared Kaggle input can be read-only and need not retain the ZIP.
+        prepared = os.path.join(root, 'CUB_200_2011')
+        if all(os.path.isdir(os.path.join(prepared, split)) for split in ('train', 'test')):
+            split = 'train' if train else 'test'
+            self.data = datasets.ImageFolder(os.path.join(prepared, split), transform=transform)
+            return
+        if os.path.isdir(os.path.join(prepared, 'images')):
+            raise RuntimeError('Raw CUB found. Prepare official splits in a writable root with '
+                               'scripts/prepare_cub.py; input images will not be moved.')
+
         fpath = os.path.join(root, self.filename)
         if not os.path.isfile(fpath):
             if not download:

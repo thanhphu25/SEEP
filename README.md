@@ -66,3 +66,10 @@ This repository is built upon the codebase of **[RainbowPrompt](https://github.c
 We thank the authors for their valuable research and for making their code publicly available.
 
 ---
+
+## Experimental N1: Spectral Response Memory
+
+Source-aligned implementation, task-boundary resume, tests and a checkpoint-config
+Kaggle launcher are available. Start with [the Kaggle guide](docs/n1_kaggle.md),
+[method and limitations](docs/n1_method.md), and [source audit](docs/n1_source_audit.md).
+`--srm-mode off` is the default. N1 effectiveness has not been established.

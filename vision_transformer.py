@@ -690,57 +690,20 @@ class VisionTransformer(nn.Module):
             res['prompts'] = unified_prompt
             return res
     
+    def spectral_coordinates(self):
+        from spectral_response_memory import coordinates
+        return coordinates(self)
+
+    def global_response(self, x, q=None):
+        from spectral_response_memory import global_response
+        return global_response(self, x, q)
+
     def get_Frequency_mask(self, input):
-        # Perform Fourier transform on the h and w dimensions
-        fft_im = torch.fft.fftn(input, dim=(-2, -1))  # 2D Fourier transform
-        fft_im_center = torch.fft.fftshift(fft_im, dim=(-2, -1))  # Shift the zero frequency to the center
-
-        # Build a grid to calculate the distance from each point to the center of the spectrum
-        Batch_size, channels, h, w = input.shape
-        y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
-        center_y, center_x = h // 2, w // 2  # Center of the spectrum
-        distances = torch.sqrt((y - center_y) ** 2 + (x - center_x) ** 2)  # Distance matrix
-        distances = distances.to(input.device)  # Ensure the device is consistent
-
-        # Create a ring mask, allow a certain tolerance range
-        beta = 4.0
-        ring_masks = []  # Store the mask of each ring
-        # Ensure radii tensor is on the same device as distances
-        radii = self.radii.to(input.device)
-        for i, radius in enumerate(radii):
-            if i == 0:
-                inner_radius = torch.tensor(0.0, device=input.device)  # The first ring starts from the center
-            else:
-                inner_radius = radii[i - 1] + 1e-6  # Ensure no overlap
-
-            # Outer radius mask
-            outer_mask = torch.sigmoid(-beta * (distances - radius))
-            # Inner radius mask
-            inner_mask = torch.sigmoid(-beta * (distances - inner_radius))
-            # Ring mask
-            ring_mask = outer_mask - inner_mask
-            ring_masks.append(ring_mask.float())  # Convert to float, for subsequent operations
-
-        # Stack the masks into a tensor of shape [10, h, w]
-        ring_masks = torch.stack(ring_masks, dim=0).to(input.device)  # [10, h, w]
-
-        # Weight each ring
+        from spectral_response_memory import frequency_transform
         temperature = getattr(self.args, 'temperature', 1.0)
-        weights_normalized = torch.softmax(self.weights * temperature, dim=0)  # Normalize the weights
-        weighted_ring_masks = weights_normalized[:, None, None] * ring_masks  # Weighted mask
-        # Sum the weighted masks, get the overall frequency mask
-        final_mask = weighted_ring_masks.sum(dim=0)  # [h, w]
-
-        # Apply the frequency mask
-        fft_selected = fft_im_center * final_mask[None, None, :, :]  # Broadcast to [Batch_size, 3, h, w]
-        
-        # Add the residual
-        fft_residual = fft_im_center + fft_selected
-
-        # Inverse Fourier transform to get back to the image domain
-        ifft_residual = torch.fft.ifftshift(fft_residual, dim=(-2, -1))
-        ifft_residual = torch.fft.ifftn(ifft_residual, dim=(-2, -1))
-        return input + (torch.abs(ifft_residual) - input) * self.frequency_residual_scale
+        p = torch.softmax(self.weights * temperature, dim=0)
+        transformed = frequency_transform(input, self.radii, p)
+        return input + (transformed - input) * self.frequency_residual_scale
 
     def forward_features(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None):
 

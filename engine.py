@@ -31,17 +31,25 @@ def _prepare_dynamic_buffers_for_checkpoint(model: torch.nn.Module, model_state:
     """
     Register runtime-created buffers before strict checkpoint loading.
     """
+    generator_ids = [int(k.split('.')[1]) for k in model_state if k.startswith('prompt_generators.')]
+    if generator_ids:
+        from spectral_response_memory import capture_rng, restore_rng
+        rng = capture_rng()
+        try:
+            model.ensure_prompt_generator(max(generator_ids))
+        finally:
+            restore_rng(rng)
     stored_prompts = model_state.get('stored_unified_prompts')
     if stored_prompts is not None and 'stored_unified_prompts' not in model._buffers:
         if hasattr(model, 'stored_unified_prompts'):
             delattr(model, 'stored_unified_prompts')
-        model.register_buffer('stored_unified_prompts', torch.zeros_like(stored_prompts))
+        model.register_buffer('stored_unified_prompts', torch.zeros_like(stored_prompts, device=next(model.parameters()).device))
 
 def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, 
                     criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0,
                     set_training_mode=True, task_id=-1, class_mask=None, args = None,
-                    feature_prefix_et=None):
+                    feature_prefix_et=None, srm=None):
 
     model.train(set_training_mode)
     original_model.eval()
@@ -91,8 +99,20 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module,
             not_mask = np.setdiff1d(np.arange(args.nb_classes), mask)
             not_mask = torch.tensor(not_mask, dtype=torch.int64).to(device)
             logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
-        loss = criterion(logits, target) 
+        classification_loss = criterion(logits, target)
+        loss = classification_loss
         loss = loss - args.balancing* output['sim_loss']
+        if srm is not None and srm.mode not in ('off', 'freeze_spectral'):
+            raw_srm = srm.penalty(model.module if hasattr(model, 'module') else model)
+            weighted_srm = args.srm_lambda * raw_srm
+            loss = loss + weighted_srm
+            metric_logger.update(srm_loss=raw_srm.item(), srm_weighted_loss=weighted_srm.item())
+            if epoch % 5 == 0 and step == 0:
+                from spectral_response_memory import gradient_diagnostics
+                logger.info(f'N1 diagnostics: {gradient_diagnostics(model, classification_loss, weighted_srm, srm.anchors[-1] if srm.anchors is not None else None)}')
+        elif srm is not None and srm.mode == 'freeze_spectral' and epoch % 5 == 0 and step == 0:
+            from spectral_response_memory import gradient_diagnostics
+            logger.info(f'N1 diagnostics: {gradient_diagnostics(model, classification_loss, classification_loss.new_zeros(()))}')
         unscaled_loss = loss.item()
             
         acc1, acc5 = accuracy(logits, target, topk=(1, 5))
@@ -109,7 +129,8 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module,
             optimizer.step()
             optimizer.zero_grad()
 
-        torch.cuda.synchronize()
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
 
         metric_logger.update(Loss=unscaled_loss)
         metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
@@ -253,8 +274,55 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
     acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
     feature_prefix_e = {}
     feature_prefix_et = None
+    managed = getattr(args, 'srm_mode', 'off') != 'off' or getattr(args, 'n1_launcher', False)
+    srm, per_task, start_task = None, [], 0
+    if managed:
+        from spectral_response_memory import SpectralResponseMemory, capture_rng, restore_rng
+        from n1_runtime import (latest_checkpoint, trusted_load, validate_boundary, run_identity,
+                                optimizer_audit, write_json, write_metrics, task_metrics,
+                                git_provenance, environment_audit, jsonable)
+        from datasets import build_transform, _unwrap_to_base_dataset
+        srm = SpectralResponseMemory(args, original_model.num_features, device)
+        class_to_idx = getattr(_unwrap_to_base_dataset(data_loader[0]['train'].dataset), 'class_to_idx', None)
+        environment = environment_audit()
+        provenance = git_provenance()
+        latest = latest_checkpoint(args.output_dir)
+        if latest is not None:
+            checkpoint = trusted_load(latest)
+            validate_boundary(checkpoint, args, class_mask)
+            resume_audit = dict(previous_environment=checkpoint['environment'], current_environment=environment,
+                                previous_git=checkpoint['git'], current_git=provenance)
+            write_json(Path(args.output_dir) / 'resume_audit.json', resume_audit)
+            if checkpoint['environment'] != environment or checkpoint['git'] != provenance:
+                logger.warning('Resume source/environment differs; see resume_audit.json. '
+                               'Exact reproduction across environments is unconfirmed.')
+            if jsonable(checkpoint['class_to_idx']) != jsonable(class_to_idx):
+                raise ValueError('Checkpoint ImageFolder class mapping mismatch')
+            _prepare_dynamic_buffers_for_checkpoint(model_without_ddp, checkpoint['model'])
+            model_without_ddp.load_state_dict(checkpoint['model'], strict=True)
+            for name, param in model_without_ddp.named_parameters():
+                param.requires_grad_(checkpoint['requires_grad'][name])
+            srm.load_state_dict(checkpoint['srm_state'])
+            names = dict(model_without_ddp.named_parameters())
+            groups = [{'params': [names[n] for n in group['names']], 'lr': group['lr']}
+                      for group in checkpoint['optimizer_audit']['groups']]
+            optimizer = create_optimizer(args, groups)
+            if args.sched != 'constant':
+                lr_scheduler, _ = create_scheduler(args, optimizer)
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            # timm scheduler construction writes initial/warmup LRs into groups.
+            # Restore the saved optimizer *after* constructing the scheduler.
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            acc_matrix = np.asarray(checkpoint['acc_matrix']).copy()
+            per_task = checkpoint['per_task']
+            start_task = checkpoint['completed_task'] + 1
+            restore_rng(checkpoint['rng_state'])
+            del checkpoint
+            write_metrics(args.output_dir, acc_matrix, per_task, args.num_tasks)
+            logger.info(f'Restored complete task boundary {start_task}; no re-evaluation or collection')
+
         
-    for task_id in range(args.num_tasks):
+    for task_id in range(start_task, args.num_tasks):
         if args.num_tasks_to_run > 0 and task_id >= args.num_tasks_to_run:
             print(f"Stopping after task {task_id}, as requested by --num_tasks_to_run")
             break
@@ -264,6 +332,9 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
             if hasattr(model_without_ddp, 'ensure_prompt_generator'):
                 model_without_ddp.ensure_prompt_generator(task_id)
         
+        if srm is not None:
+            srm.begin_task(model_without_ddp, task_id)
+
         lgsp_params_set = set() # Store ids to exclude from general params
         lgsp_groups = []
 
@@ -301,9 +372,10 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
 
         # Resume capability: Check if checkpoint exists
         checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
-        if os.path.exists(checkpoint_path):
+        if not managed and os.path.exists(checkpoint_path):
             print(f"Checkpoint found at {checkpoint_path}. Resuming...")
-            checkpoint = torch.load(checkpoint_path)
+            from n1_runtime import trusted_load
+            checkpoint = trusted_load(checkpoint_path)
             _prepare_dynamic_buffers_for_checkpoint(model_without_ddp, checkpoint['model'])
             model_without_ddp.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -317,18 +389,29 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
                                         acc_matrix=acc_matrix, args=args)
             continue # Skip training loop
                 
+        if managed:
+            group_audit = optimizer_audit(model_without_ddp, optimizer, task_id)
+            logger.info(f'Optimizer groups: {group_audit}')
+            write_json(Path(args.output_dir) / f'optimizer_task{task_id + 1}.json', group_audit)
+        epoch_srm_losses = []
         for epoch in range(args.epochs):           
             train_stats = train_one_epoch(model=model, original_model=original_model, criterion=criterion,
                                           data_loader=data_loader[task_id]['train'], optimizer=optimizer,
                                           device=device, epoch=epoch, max_norm=args.clip_grad,
                                           set_training_mode=True, task_id=task_id, class_mask=class_mask, args=args,
-                                          feature_prefix_et=feature_prefix_et)
+                                          feature_prefix_et=feature_prefix_et, srm=srm)
+            epoch_srm_losses.append(train_stats.get('srm_loss', 0.0))
             if lr_scheduler:
                 lr_scheduler.step(epoch)
         
         
         test_stats = evaluate_till_now(model=model, original_model=original_model, data_loader=data_loader, device=device, 
                                     task_id=task_id, class_mask=class_mask, acc_matrix=acc_matrix, args=args)
+        if managed:
+            collector = srm.collect(model_without_ddp, original_model, data_loader[task_id]['train'].dataset,
+                                    class_mask[task_id], build_transform(False, args), task_id)
+            per_task.append(task_metrics(acc_matrix, task_id, np.mean(epoch_srm_losses), collector))
+            write_json(Path(args.output_dir) / f'collector_task{task_id + 1}.json', collector)
         if args.output_dir and utils.is_main_process():
             Path(os.path.join(args.output_dir, 'checkpoint')).mkdir(parents=True, exist_ok=True)
 
@@ -339,10 +422,27 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
                     'epoch': epoch,
                     'args': args,
                 }
+            if managed:
+                pre_scaling_args = vars(args).copy()
+                pre_scaling_args['lr'] = args.lr_pre_scaling
+                pre_scaling_args.pop('lr_effective', None)
+                state_dict.update(srm_state=srm.state_dict(), completed_task=task_id,
+                                  acc_matrix=acc_matrix, per_task=per_task, rng_state=capture_rng(),
+                                  run_identity=run_identity(args), resolved_seed=args.resolved_seed,
+                                  lr_pre_scaling=args.lr_pre_scaling, lr_effective=args.lr,
+                                  args_pre_scaling=pre_scaling_args, effective_args=vars(args).copy(), class_mask=class_mask,
+                                  class_to_idx=class_to_idx, git=provenance, environment=environment,
+                                  optimizer_audit=optimizer_audit(model_without_ddp, optimizer, task_id),
+                                  requires_grad={n: p.requires_grad for n, p in model_without_ddp.named_parameters()})
             if args.sched is not None and args.sched != 'constant':
                 state_dict['lr_scheduler'] = lr_scheduler.state_dict()
 
-            utils.save_on_master(state_dict, checkpoint_path)
+            if managed:
+                utils.save_on_master(state_dict, checkpoint_path + '.tmp')
+                os.replace(checkpoint_path + '.tmp', checkpoint_path)
+                write_metrics(args.output_dir, acc_matrix, per_task, args.num_tasks)
+            else:
+                utils.save_on_master(state_dict, checkpoint_path)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
             **{f'test_{k}': v for k, v in test_stats.items()},

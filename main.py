@@ -50,8 +50,11 @@ def initialize_experiment(seed=None):
         seed = random.randint(1, 100000)
     set_seed(seed)
     save_seed(seed)
+    return seed
 
 def main(args):
+    from srm_config import validate_srm
+    validate_srm(args)
     
     log_dir = os.path.join('./logs')
     if not os.path.exists(log_dir):
@@ -63,7 +66,17 @@ def main(args):
     args_str = ', '.join(f'{k}={v}' for k, v in vars(args).items())
     logger.info(f'Parsed arguments: {args_str}')
     
-    initialize_experiment(seed=args.seed)
+    seed_to_initialize = args.seed
+    if args.seed == 0 and (getattr(args, 'srm_mode', 'off') != 'off' or getattr(args, 'n1_launcher', False)):
+        from n1_runtime import latest_checkpoint, trusted_load
+        latest = latest_checkpoint(args.output_dir)
+        if latest is not None:
+            boundary = trusted_load(latest)
+            seed_to_initialize = boundary.get('resolved_seed')
+            del boundary
+            if not isinstance(seed_to_initialize, int) or seed_to_initialize <= 0:
+                raise ValueError('N1 resume checkpoint lacks a positive resolved_seed')
+    args.resolved_seed = initialize_experiment(seed=seed_to_initialize)
     
     utils.init_distributed_mode(args)
 
@@ -142,7 +155,8 @@ def main(args):
             checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
             if os.path.exists(checkpoint_path):
                 print('Loading checkpoint from:', checkpoint_path)
-                checkpoint = torch.load(checkpoint_path)
+                from n1_runtime import trusted_load
+                checkpoint = trusted_load(checkpoint_path)
                 _prepare_dynamic_buffers_for_checkpoint(model, checkpoint['model'])
                 model.load_state_dict(checkpoint['model'])
             else:
@@ -180,7 +194,9 @@ def main(args):
         global_batch_size = args.batch_size
     else:
         global_batch_size = args.batch_size * args.world_size
+    args.lr_pre_scaling = args.lr
     args.lr = args.lr * global_batch_size / 256.0
+    args.lr_effective = args.lr
 
     optimizer = create_optimizer(args, model_without_ddp)
 
@@ -252,13 +268,3 @@ if __name__ == '__main__':
     main(args)
     
     sys.exit(0)
-    
-
-
-
-
-
-
-
-
- 

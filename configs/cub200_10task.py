@@ -13,6 +13,8 @@ except ImportError:
 
 
 def get_args_parser(subparsers):
+    from srm_config import add_srm_args
+    add_srm_args(subparsers)
     subparsers.add_argument('--batch-size', default=32, type=int, help='Batch size per device')
     subparsers.add_argument('--epochs', default=30, type=int)
     subparsers.add_argument('--seed', default=0, type=int)
