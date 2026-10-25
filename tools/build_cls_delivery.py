@@ -116,7 +116,7 @@ def build():
         patch = base64.b64decode(PATCH_B64)
         assert hashlib.sha256(patch).hexdigest() == PATCH_SHA256
         if not REPO.exists():
-            subprocess.check_call(['git', 'clone', 'https://github.com/thanhphu25/SEEP.git', str(REPO)])
+            subprocess.check_call(['git', 'clone', '--config', 'core.autocrlf=false', 'https://github.com/thanhphu25/SEEP.git', str(REPO)])
             subprocess.check_call(['git', 'checkout', '--detach', BASE_COMMIT], cwd=REPO)
             subprocess.check_call(['git', 'switch', '-c', 'feat/cls-steering-cil'], cwd=REPO)
             patch_file = REPO/'cls_steering_implementation.patch'

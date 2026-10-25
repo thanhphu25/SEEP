@@ -35,7 +35,7 @@ def verify(notebook_path, scratch, report_dir):
     if scratch.exists():
         raise FileExistsError('Use a new empty verification checkout: '+str(scratch))
     scratch.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.check_call(['git', 'clone', '--no-hardlinks', '--no-checkout', str(root), str(scratch)])
+    subprocess.check_call(['git', 'clone', '--config', 'core.autocrlf=false', '--no-hardlinks', '--no-checkout', str(root), str(scratch)])
     subprocess.check_call(['git', 'checkout', '--detach', literals['BASE_COMMIT']], cwd=scratch)
     patch_file = scratch/'cls_steering_implementation.patch'
     patch_file.write_bytes(patch)
