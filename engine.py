@@ -249,6 +249,11 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
                     criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer, lr_scheduler, device: torch.device, 
                     class_mask=None, args = None,):
 
+    if getattr(args, 'dgca', 'off') != 'off':
+        from modules.dgca_runtime import train_and_evaluate_dgca
+        return train_and_evaluate_dgca(model, model_without_ddp, original_model, criterion,
+                                       data_loader, optimizer, lr_scheduler, device, class_mask, args)
+
     # create matrix to save end-of-task accuracies 
     acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
     feature_prefix_e = {}

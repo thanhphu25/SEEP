@@ -230,8 +230,9 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x, prompt=None):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), prompt)))
+    def forward(self, x, prompt=None, steering=None):
+        attention = self.attn(self.norm1(x), prompt) if steering is None else self.attn(self.norm1(x), prompt, steering=steering)
+        x = x + self.drop_path1(self.ls1(attention))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
@@ -499,6 +500,9 @@ class VisionTransformer(nn.Module):
         else:
             # Prefix tunning
             attn_layer = PreT_Attention
+        if getattr(args, 'cls_steering', 'off') == 'task':
+            # Same projection/attention without a prefix is supported as well.
+            attn_layer = PreT_Attention
         
         self.total_prompt_len = 0
         if self.prompt_pool:
@@ -518,6 +522,14 @@ class VisionTransformer(nn.Module):
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
+
+        self.cls_steering = None
+        if getattr(args, 'cls_steering', 'off') == 'task':
+            from modules.cls_steering import CLSSteering
+            if not class_token:
+                raise ValueError('CLS steering requires a CLS token')
+            self.cls_steering = CLSSteering(n_tasks or args.num_tasks,
+                                          args.cls_steering_layers, embed_dim, depth)
 
     def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'moco', '')
@@ -743,6 +755,11 @@ class VisionTransformer(nn.Module):
         return input + (torch.abs(ifft_residual) - input) * self.frequency_residual_scale
 
     def forward_features(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None):
+        steering_task = task_id if train else self.matched_task_id
+        if self.cls_steering is not None and train and int(self.cls_steering.active_task) != task_id:
+            raise RuntimeError('Activate current CLS steering bank at the task boundary before training')
+        if self.cls_steering is not None and self.grad_checkpointing:
+            raise ValueError('CLS steering screening does not use gradient checkpointing')
 
         if train:
             if epoch_info >= self.warmup:
@@ -786,16 +803,21 @@ class VisionTransformer(nn.Module):
                 self.e_prefix_feature = {}
 
                 for i, block in enumerate(self.blocks):
+                    delta = self.cls_steering.delta(steering_task, i) if self.cls_steering is not None else None
                     if i in self.e_prompt_layer_idx:
                         res = self.rainbow_prompt(x, layer=i, previous_mask=previous_mask, cls_features=cls_features, task_id=task_id, cur_id=learned_id, train=train, p_type=prompt_type)
                         e_prompt = res['batched_prompt']
-                        x = block(x, prompt=e_prompt)
+                        x = block(x, prompt=e_prompt, steering=delta)
 
                     else:
-                        x = block(x)
+                        x = block(x, steering=delta)
 
             else:
-                x = self.blocks(x)
+                if self.cls_steering is None:
+                    x = self.blocks(x)
+                else:
+                    for i, block in enumerate(self.blocks):
+                        x = block(x, steering=self.cls_steering.delta(steering_task, i))
                 res = dict()
         x = self.norm(x)
         res['x'] = x
@@ -820,6 +842,7 @@ class VisionTransformer(nn.Module):
         res['pre_logits'] = x
 
         x = self.fc_norm(x)
+        res['classifier_features'] = x
         
         res['logits'] = self.head(x)
         

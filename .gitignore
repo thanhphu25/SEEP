@@ -1,2 +1,5 @@
 __pycache__
 logs/*
+.test-runs/
+artifacts/
+.pytest_cache/

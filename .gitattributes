@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.patch -text -whitespace
+*.ipynb -text
+references/** -text -whitespace

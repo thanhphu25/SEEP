@@ -1,0 +1,11 @@
+{
+  "archive_sha256": "570a0e4705202f369ab72d265c4d3022d00a73682d5829b1c710d7bdf2f11f80",
+  "files_sha256": {
+    "task_accuracy_matrix_raw_seen.csv": "8ca1ce9a02f4ce7e0658a7583f7ecb2410623f39e185ac8aa8e69683736a3b2a",
+    "task_accuracy_matrix_dgca.csv": "f341a173ca0c3a372ebe151900f4a0e309c06a5ab662afd7805069a6d60d003c",
+    "official_split_manifest.json": "ccf1a0227ee8f3e72bebb73fce7896b79ea48b784c1a44770a8a5f78cfcd391f"
+  },
+  "split_sha256": "7f1cbc969854e73a21fba66461422d852d77405aa71dfbf9712d5f74de825e40",
+  "pretrained_sha256": "ac7478131e1b77e5c2f0225849730bd19ee89cfffe600c2dfd2272b34a50a43d",
+  "dgca_patch_sha256": "ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e"
+}

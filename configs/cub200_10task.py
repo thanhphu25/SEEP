@@ -13,6 +13,17 @@ except ImportError:
 
 
 def get_args_parser(subparsers):
+    subparsers.add_argument('--cls-steering', choices=['off', 'task'], default='off')
+    subparsers.add_argument('--cls-steering-layers', type=int, nargs='+', default=[9, 10, 11])
+    subparsers.add_argument('--cls-steering-lr', type=float, default=0.0005)
+    # DGCA is opt-in; all baseline defaults below are unchanged.
+    subparsers.add_argument('--dgca', choices=['off', 'transport', 'align_only'], default='off')
+    subparsers.add_argument('--dgca-ridge', type=float, default=1.0)
+    subparsers.add_argument('--dgca-shrinkage', type=float, default=0.1)
+    subparsers.add_argument('--dgca-samples-per-class', type=int, default=128)
+    subparsers.add_argument('--dgca-epochs', type=int, default=5)
+    subparsers.add_argument('--dgca-lr', type=float, default=0.01)
+    subparsers.add_argument('--dgca-resume', action='store_true', help='Resume own trusted completed-boundary checkpoint')
     subparsers.add_argument('--batch-size', default=32, type=int, help='Batch size per device')
     subparsers.add_argument('--epochs', default=30, type=int)
     subparsers.add_argument('--seed', default=0, type=int)

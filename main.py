@@ -52,6 +52,8 @@ def initialize_experiment(seed=None):
     save_seed(seed)
 
 def main(args):
+    if getattr(args, 'cls_steering', 'off') == 'task' and getattr(args, 'dgca', 'off') != 'align_only':
+        raise ValueError('CLS screening requires --dgca align_only')
     
     log_dir = os.path.join('./logs')
     if not os.path.exists(log_dir):
@@ -120,6 +122,10 @@ def main(args):
         D2=args.D2,
         args=args
     )
+    if getattr(args, 'cls_steering', 'off') == 'task':
+        from modules.cls_pretrained import verify_pretrained_models
+        args.cls_pretrained_verification = verify_pretrained_models(original_model, model)
+        logger.info('Pretrained routing/prompted tensors verified: {}', args.cls_pretrained_verification)
     original_model.to(device)
     model.to(device) 
 
@@ -134,6 +140,13 @@ def main(args):
             if n.startswith(tuple(args.freeze)):
                 p.requires_grad = False
     
+
+    if args.eval and getattr(args, 'dgca', 'off') != 'off':
+        from modules.dgca_runtime import evaluate_checkpoint
+        # The training entry point scales LR before checkpoint config validation.
+        args.lr *= args.batch_size * (1 if args.unscale_lr else args.world_size) / 256.0
+        print(evaluate_checkpoint(model, original_model, data_loader, device, class_mask, args))
+        return
 
     if args.eval:
         acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
@@ -252,13 +265,3 @@ if __name__ == '__main__':
     main(args)
     
     sys.exit(0)
-    
-
-
-
-
-
-
-
-
- 

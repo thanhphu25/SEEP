@@ -16,7 +16,6 @@ from torchvision import datasets, transforms
 from timm.data import create_transform
 from PIL import Image, ImageFilter, ImageOps
 from continual_datasets.continual_datasets import *
-from continual_datasets.video_datasets import UCF101, ActivityNet
 
 import utils
 
@@ -47,6 +46,11 @@ def collate_video(batch):
     return torch.stack(videos, dim=0), torch.as_tensor(labels, dtype=torch.long)
 
 def build_continual_dataloader(args):
+    # Image experiments do not need a video decoder (not available on all hosts).
+    video_types = ()
+    if args.dataset in ('UCF101', 'ActivityNet', 'Split-UCF101', 'Split-ActivityNet'):
+        from continual_datasets.video_datasets import UCF101, ActivityNet
+        video_types = (ActivityNet, UCF101)
     dataloader = list()
     class_mask = list() if args.task_inc or args.train_mask else None
 
@@ -102,7 +106,7 @@ def build_continual_dataloader(args):
 
         base_train = _unwrap_to_base_dataset(dataset_train)
         video_collate = (
-            collate_video if (isinstance(base_train, ActivityNet) or isinstance(base_train, UCF101)) else None
+            collate_video if isinstance(base_train, video_types) else None
         )
         
         # Flattening (B, S, C, H, W) -> (B*S, C, H, W) multiplies per-step activations by S; keep the
@@ -197,10 +201,12 @@ def get_dataset(dataset, transform_train, transform_val, args,):
         dataset_val = Imagenet_R(args.data_path, train=False, download=True, transform=transform_val).data
     
     elif dataset == 'UCF101':
+        from continual_datasets.video_datasets import UCF101
         dataset_train = UCF101(args.data_path, train=True, num_tasks = args.num_tasks, transform=transform_train)
         dataset_val   = UCF101(args.data_path, train=False, num_tasks = args.num_tasks, transform=transform_val)
  
     elif dataset == 'ActivityNet':
+        from continual_datasets.video_datasets import ActivityNet
         dataset_train = ActivityNet(args.data_path, train=True, num_tasks = args.num_tasks, transform=transform_train)
         dataset_val   = ActivityNet(args.data_path, train=False, num_tasks = args.num_tasks, transform=transform_val)
 

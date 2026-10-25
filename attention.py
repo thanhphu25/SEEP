@@ -10,6 +10,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def apply_cls_delta(q, k, v, delta):
+    """Change real-token row zero before any prefix concatenation; no in-place ops."""
+    def add(tensor, vector):
+        offset = vector.reshape(1, tensor.shape[1], 1, tensor.shape[-1])
+        return torch.cat((tensor[:, :, :1] + offset, tensor[:, :, 1:]), dim=2)
+    return tuple(add(tensor, vector) for tensor, vector in zip((q, k, v), delta))
+
 class PreT_Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -22,10 +29,12 @@ class PreT_Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, prompt):
+    def forward(self, x, prompt=None, steering=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        if steering is not None:
+            q, k, v = apply_cls_delta(q, k, v, steering)
         self.key_ = q
         if prompt is not None:
             pk, pv = prompt
@@ -37,6 +46,12 @@ class PreT_Attention(nn.Module):
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
+        # Opt-in current-train diagnostic only; never retain a full attention map.
+        capture = getattr(self, '_cls_capture', None)
+        if capture is not None:
+            prefix = k.shape[2] - N
+            capture.append({'prefix_length': prefix,
+                            'cls_attention': attn[:, :, 0].detach().cpu()})
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
