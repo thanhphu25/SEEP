@@ -1,0 +1,15 @@
+{
+  "notebook_sha256": "348b478cddaad19f5a30f80d80bfa30211cd3a0d0d67ded8317bdfceee38bd19",
+  "patch_sha256": "369c5c0e01d615e8ee4fde0db6e2e55087080b85e3f97a6e164686f063112aa5",
+  "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
+  "implementation_source_commit": "39441365d50794bec6c999b338d998c844dd90aa",
+  "compiled_code_cells": 8,
+  "all_outputs_cleared": true,
+  "clean_base_patch_apply_check": true,
+  "clean_base_patch_apply_count": 1,
+  "all_source_hashes_match": true,
+  "reconstructed_tests_returncode": 0,
+  "python": "3.9.25 (main, Oct 31 2025, 22:56:13) [MSC v.1929 64 bit (AMD64)]",
+  "gpu_smoke_executed_locally": false,
+  "full_cub_run_executed_locally": false
+}
