@@ -88,7 +88,7 @@ def smoke(args):
         state = torch.load(checkpoint, map_location='cpu', weights_only=False)
         prepare_dynamic_model(model, state['model'])
         model.load_state_dict(state['model'], strict=True)
-        clone = DGCA(epochs=1, samples_per_class=4)
+        clone = DGCA(**dgca.config)
         clone.load_state_dict(state['dgca'], model.head)
         torch.testing.assert_close(clone.alignment_head(after['features'].to(device)),
                                    dgca.alignment_head(after['features'].to(device)), rtol=0, atol=0)

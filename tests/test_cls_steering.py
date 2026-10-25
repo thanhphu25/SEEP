@@ -400,3 +400,52 @@ def test_full_width_depth_selected_blocks_synthetic_single_batch():
     assert (model.cls_steering.banks[0].grad.norm(dim=-1) > 0).all()
     for handle in handles:
         handle.remove()
+
+
+@pytest.mark.parametrize('mode', ['align_only', 'transport'])
+def test_smoke_checkpoint_reloads_same_dgca_config_on_cpu(tmp_path, monkeypatch, mode):
+    """Execute the smoke runner, substituting only external GPU/data/weights.
+
+    Actual feature collection, optimization, DGCA, torch save/load and the
+    script's strict reload/output check all run. This is a CPU regression test.
+    """
+    import tools.smoke_dgca as smoke_module
+    import modules.cls_pretrained as pretrained_module
+    from modules.dgca import DGCA
+
+    base = image_folder(tmp_path/'images')
+    base.transform = transforms.ToTensor()
+    data = [{'train': DataLoader(Subset(base, ids), batch_size=32),
+             'val': DataLoader(Subset(base, ids), batch_size=32)}
+            for ids in (list(range(8)), list(range(8, 12)))]
+    args = config()
+    args.device, args.input_size, args.dgca = 'cpu', 16, mode
+    args.cls_steering = 'task' if mode == 'align_only' else 'off'
+    args.lr = .03
+
+    class SmokeTorch:
+        # Only the script's environment gate/memory report are simulated.
+        # DGCA and feature code retain real torch.cuda.is_available() == False.
+        cuda = SimpleNamespace(is_available=lambda: True, max_memory_allocated=lambda: 0)
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+    instances = []
+
+    def dgca_factory(**kwargs):
+        result = DGCA(**kwargs)
+        instances.append(result)
+        return result
+
+    monkeypatch.setattr(smoke_module, 'torch', SmokeTorch())
+    monkeypatch.setattr(smoke_module, 'DGCA', dgca_factory)
+    monkeypatch.setattr(smoke_module, 'build_continual_dataloader', lambda args: (data, [[0, 1], [2]]))
+    monkeypatch.setattr(smoke_module, 'create_model', lambda *a, **kwargs:
+                        make_model(args.cls_steering) if 'args' in kwargs else Original())
+    monkeypatch.setattr(pretrained_module, 'verify_pretrained_models', lambda *models: None)
+    smoke_module.smoke(args)
+    assert len(instances) == 2
+    assert instances[0].config == instances[1].config
+    assert instances[1].config['mode'] == mode
+    assert instances[1].completed_boundary == (0 if mode == 'align_only' else 1)
