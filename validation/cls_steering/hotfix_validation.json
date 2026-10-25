@@ -1,0 +1,9 @@
+{
+  "existing_notebook_hotfix_validated": true,
+  "idempotent": true,
+  "full_patch_reconstructs_on_clean_base": true,
+  "all_source_hashes_match": true,
+  "old_patch_sha256": "369c5c0e01d615e8ee4fde0db6e2e55087080b85e3f97a6e164686f063112aa5",
+  "hotfix_patch_sha256": "57d34dace52365c32ce6999181b1e96e9b989303ebf761fba1b312367c2c198c",
+  "gpu_run_executed": false
+}
