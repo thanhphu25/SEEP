@@ -690,7 +690,7 @@ class VisionTransformer(nn.Module):
             res['prompts'] = unified_prompt
             return res
     
-    def get_Frequency_mask(self, input):
+    def get_Frequency_mask(self, input, frequency_state=None):
         # Perform Fourier transform on the h and w dimensions
         fft_im = torch.fft.fftn(input, dim=(-2, -1))  # 2D Fourier transform
         fft_im_center = torch.fft.fftshift(fft_im, dim=(-2, -1))  # Shift the zero frequency to the center
@@ -726,7 +726,8 @@ class VisionTransformer(nn.Module):
 
         # Weight each ring
         temperature = getattr(self.args, 'temperature', 1.0)
-        weights_normalized = torch.softmax(self.weights * temperature, dim=0)  # Normalize the weights
+        selected_weights = self.weights if frequency_state is None else frequency_state['weights']
+        weights_normalized = torch.softmax(selected_weights * temperature, dim=0)  # Normalize the weights
         weighted_ring_masks = weights_normalized[:, None, None] * ring_masks  # Weighted mask
         # Sum the weighted masks, get the overall frequency mask
         final_mask = weighted_ring_masks.sum(dim=0)  # [h, w]
@@ -740,9 +741,10 @@ class VisionTransformer(nn.Module):
         # Inverse Fourier transform to get back to the image domain
         ifft_residual = torch.fft.ifftshift(fft_residual, dim=(-2, -1))
         ifft_residual = torch.fft.ifftn(ifft_residual, dim=(-2, -1))
-        return input + (torch.abs(ifft_residual) - input) * self.frequency_residual_scale
+        selected_scale = self.frequency_residual_scale if frequency_state is None else frequency_state['frequency_residual_scale']
+        return input + (torch.abs(ifft_residual) - input) * selected_scale
 
-    def forward_features(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None):
+    def forward_features(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None, frequency_state=None):
 
         if train:
             if epoch_info >= self.warmup:
@@ -764,8 +766,10 @@ class VisionTransformer(nn.Module):
                 res = self.get_prompts(x, task_id=learned_id, train=train)  
                 prompts = res['prompts']
                 input1 = x + prompts * 1
-                input2 = self.get_Frequency_mask(x)
-                x = self.alpha * input1 + self.beta * input2
+                input2 = self.get_Frequency_mask(x, frequency_state=frequency_state)
+                selected_alpha = self.alpha if frequency_state is None else frequency_state['alpha']
+                selected_beta = self.beta if frequency_state is None else frequency_state['beta']
+                x = selected_alpha * input1 + selected_beta * input2
             elif lgsp_type == 'LSP':
                 res = self.get_prompts(x, task_id=learned_id, train=train)  
                 prompts = res['prompts']
@@ -820,12 +824,13 @@ class VisionTransformer(nn.Module):
         res['pre_logits'] = x
 
         x = self.fc_norm(x)
+        res['classifier_features'] = x
         
         res['logits'] = self.head(x)
         
         return res
 
-    def forward(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None):
+    def forward(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None, frequency_bank=None):
         if not train and cls_features is not None:
             matched_task_id = self.match_task_rainbow_style(cls_features, learned_id)
             self.matched_task_id = matched_task_id
@@ -834,7 +839,12 @@ class VisionTransformer(nn.Module):
             # During training, use provided task_id
             self.matched_task_id = task_id
         
-        res = self.forward_features(x, task_id=task_id, learned_id=learned_id, cls_features=cls_features, train=train, epoch_info=epoch_info)
+        frequency_state = None
+        if not train and frequency_bank is not None:
+            if cls_features is None:
+                raise ValueError('Frequency snapshots require the original CLS router')
+            frequency_state = frequency_bank.select(self.matched_task_id, learned_id, x.device)
+        res = self.forward_features(x, task_id=task_id, learned_id=learned_id, cls_features=cls_features, train=train, epoch_info=epoch_info, frequency_state=frequency_state)
         res = self.forward_head(res)
         return res
 

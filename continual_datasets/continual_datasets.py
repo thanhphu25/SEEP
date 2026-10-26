@@ -424,6 +424,12 @@ class CUB200(torch.utils.data.Dataset):
         self.target_transform=target_transform
         self.train = train
 
+        # Official-split adapters may prepare ImageFolder trees without an archive.
+        prepared = os.path.join(root, 'CUB_200_2011')
+        if all(os.path.isdir(os.path.join(prepared, split)) for split in ('train', 'test')):
+            self.data = datasets.ImageFolder(os.path.join(prepared, 'train' if train else 'test'), transform=transform)
+            return
+
         self.url = 'https://data.deepai.org/CUB200(2011).zip'
         self.filename = 'CUB200(2011).zip'
 

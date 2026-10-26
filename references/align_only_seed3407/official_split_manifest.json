@@ -1,0 +1,12 @@
+{
+  "source": "/kaggle/input/datasets/trungkiennguyn/lgsp-dataset/LGSP/CUB_200_2011/CUB_200_2011",
+  "image_count": 11788,
+  "train": 5994,
+  "test": 5794,
+  "classes": 200,
+  "official_metadata_sha256": {
+    "images.txt": "e1cfc5ed1f4bd1b838040784b6f75c44f7a25d9b31707a3adab49ec694618c1f",
+    "image_class_labels.txt": "e9df8c96d897994a245746fe2c98914b9b31f5342bddc6e8b06bdfbf45e49b02",
+    "train_test_split.txt": "8bbbfcc09b4d3c9c6e3e40c9874bd863eb6658f4f456e472df1b33d3403d2600"
+  }
+}

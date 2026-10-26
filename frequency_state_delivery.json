@@ -1,0 +1,25 @@
+{
+  "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
+  "branch": "feat/task-frequency-state",
+  "patch_sha256": "8f274c9b85868d105eb6ef614ae445ab3d0321a358c84f6893d4f6f049c5aa14",
+  "source_files_sha256": {
+    "vision_transformer.py": "26a78b4d8653d0e03af9d99c5b34a4067c61bc0c7d00b8d8f448c3b167e725a4",
+    "engine.py": "01ac70aae604fb356ea058bb5b878137170990c912779c95ccae3c18c6c674ff",
+    "datasets.py": "d9a75e0685cf6f2b95a6af57f4be854c12e647e9e71bafed30a95e06eb43f835",
+    "continual_datasets/continual_datasets.py": "89d9ed00a4c273ef131bbdef79ec394fd903e20ed1ce62b1c8c36aecf9b7c8d1",
+    "modules/frequency_state.py": "9d49ac3879ec4145ef720c133422cd9135780ab6879aa181ee22b9245a7fa8ef",
+    "tools/frequency_setup.py": "60df75fcdc4716772bd0c2f623dedbe858b8ab599ebcc338c9c199f553df33d4",
+    "tools/frequency_run.py": "12425cb9b76eecd01ada91735bb086b83fbb1123c283b8399c41ce2ff7da4fd7",
+    "tools/prepare_cub200.py": "5ec826cd800bc9a2038c9dd432c5b589d2f5696c8470a47acbdac5d53bad1ee2",
+    "tools/build_frequency_delivery.py": "6836288ff3c5035a64249007602540299f4bd7441944cc63ac21676731384493",
+    "tools/verify_frequency_delivery.py": "adc493026cf0632a2bc0731fd135fcd691fef494a7a3fb463874d7cbac29dd7d",
+    "tests/test_frequency_state.py": "5e1409d79573feca54ba65680936257d373e1536b513d1779f4e2578d933bb2e",
+    "README_FREQUENCY_STATE.md": "3737443b5e959f55723651b39b684786a0ae356f1716f79107740663ff78b978",
+    "references/align_only_seed3407/provenance.json": "ceff45e6a12f3d778ec827858bb5027181ec110edc3672ba65a1f5442247a654",
+    "references/align_only_seed3407/official_split_manifest.json": "ccf1a0227ee8f3e72bebb73fce7896b79ea48b784c1a44770a8a5f78cfcd391f",
+    "references/align_only_seed3407/source_manifest.json": "8703961a833ed7c1a77a909ef88485aa5dde191b6575efb350160607c182491c"
+  },
+  "serialization": "LF",
+  "source_mode": "embedded patch; no remote feature branch required",
+  "reused_dgca_patch_sha256": "ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e"
+}

@@ -1,0 +1,91 @@
+{
+  "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
+  "implementation_commit": "80081081ab42769d102f83d447705da0639e2fb1",
+  "branch": "experiment/align-only-seed3407",
+  "working_tree_status": "M configs/cub200_10task.py\n M continual_datasets/continual_datasets.py\n M datasets.py\n M engine.py\n M main.py\n M vision_transformer.py\n?? README_DGCA.md\n?? align_only_preflight_change.json\n?? dgca_delivery.json\n?? dgca_implementation.patch\n?? modules/\n?? tests/\n?? timm_compatibility.json\n?? tools/\n?? transport_reference.json",
+  "diff_sha256": "ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e",
+  "source_files_sha256": {
+    "prompt.py": "052d288a335d3d4255fad6a679890ddef3c4f1de837ece2064c1e8f67857b465",
+    "datasets.py": "d9a75e0685cf6f2b95a6af57f4be854c12e647e9e71bafed30a95e06eb43f835",
+    "adaptive_prompting.py": "a875ed0de97054400d019e3808caefe675bb4fcec8a7dae0af87ef8978c162c6",
+    "engine.py": "ad18248616085ee608b4af15828a70ea0b35c5574e03ad44869830f32af3fd5a",
+    "models.py": "9a6f7e1ea649de8d0fcce772f1197eaa065fbf0540d0a3a4b17d7d0592f50e37",
+    "attention.py": "bed8a5f1dbc13717e7c0ae29ae9bab16d15592428d91e9547a4a25cf22f67e5c",
+    "vision_transformer.py": "5a9d2ee07b1ea1a0977da86ad64bedac92603269c629c42d14117608e49783fc",
+    "utils.py": "7f4c402e074590068c5440c501f6f8b571d1e9ed564a1559dbd8737264ef4e6d",
+    "main.py": "a4366f3833db28008044c021c7e55bcf85bda6b4230d61685bae736c371566de",
+    "modules/dgca.py": "0580058d687cba11745ce69f72560126aa90a7585bcd043b20d53c9f79100acd",
+    "modules/dgca_data.py": "3ef5c119c4e2193d4d96eaddd116927ec926bed8dfdba10031ac3739dc64095e",
+    "modules/dgca_runtime.py": "45df5dd4a1d9866139836280e321a1bb042d2dab9b0ae276034ee57d7ef2010b",
+    "tools/smoke_dgca.py": "f80b0779fa5478c1c3b2c33eeb1cb7fd7a7763f0201429c14d5c9c347767658e",
+    "tools/summarize_dgca.py": "a82ca711a1ccfa7a001d0d05a6fdf5f0bef7d97381ad1fdd844f30573f81e4f2",
+    "tools/preflight_dgca.py": "6a834795c5f396f496b9b20146e2f57c2d262aa1c47760b611b77e520e5aad81",
+    "tools/build_dgca_delivery.py": "1406f1dc6b672fc6682cc4fbcdc7a15f6d63659544555eeab6e78dd7216cb394",
+    "tools/prepare_cub200.py": "5ec826cd800bc9a2038c9dd432c5b589d2f5696c8470a47acbdac5d53bad1ee2",
+    "configs/cifar100_20task.py": "9f3200cf298de1db3399db5ef6a1278912f4df7e73c385417b3672dbbbfa9890",
+    "configs/imr_10task.py": "95fa7342737d7040e5b54796e68df1f6c2a22eb12fe00e787c77c3692ee48529",
+    "configs/ucf101_20task.py": "f35770661bdf8a91c10f242811a6ce466c654f06fcfd3d2f22f148344088c53c",
+    "configs/activitynet_20task.py": "68a43782523df611e5e3a23a562a4a02047b01a815e6a18a5b6257b73c024a0c",
+    "configs/ucf101_10task.py": "aeaec11bd841c28549fb5dd9c8d213b9dde0cc53c39e3652a6f7c644bf676aac",
+    "configs/activitynet_10task.py": "49f7f3c6de63807e9841250d7875027c1ba88463d15a52d4299e53482ebecab9",
+    "configs/cifar100_10task.py": "009d750d13799b17ca7f91cb1418d67a4c2a15b2ca47c0b8fdd624cbfdce62b2",
+    "configs/imr_20task.py": "e76e4c996572737c7bcdc5906dd124135b9e6129f20f9fa61f3f2547201cefb5",
+    "configs/cub200_10task.py": "5cb3958c5a92a6e761910b783e376eac579341873840f47cda4eeee9e8de7d2a",
+    "configs/cub200_20task.py": "e5720039debb826bd491ff0cf6367be06befb0d49b8f6a3920d3d928578c4e59"
+  },
+  "pretrained_source": {
+    "url": "https://storage.googleapis.com/vit_models/imagenet21k/ViT-B_16.npz",
+    "num_classes": 1000,
+    "input_size": [
+      3,
+      224,
+      224
+    ],
+    "pool_size": null,
+    "crop_pct": 0.9,
+    "interpolation": "bicubic",
+    "fixed_input_size": true,
+    "mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "std": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "first_conv": "patch_embed.proj",
+    "classifier": "head",
+    "architecture": "vit_base_patch16_224"
+  },
+  "cached_weights_sha256": {
+    "ViT-B_16.npz": "ac7478131e1b77e5c2f0225849730bd19ee89cfffe600c2dfd2272b34a50a43d"
+  },
+  "original_representation_sha256": "f54beb937f1147de7b8cb6f3069b39c9ddc32fa8404f6c339dcf0ba0047cda1a",
+  "delivery_manifest": {
+    "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
+    "implementation_source_commit": "05c482b536802d614ce68ab36f20ac79db3caa92",
+    "branch": "feat/dgca-classifier-alignment",
+    "patch_sha256": "ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e",
+    "delivery_mode": "embedded_patch_on_pinned_base",
+    "source_files": [
+      "configs/cub200_10task.py",
+      "continual_datasets/continual_datasets.py",
+      "datasets.py",
+      "engine.py",
+      "main.py",
+      "vision_transformer.py",
+      "modules/dgca.py",
+      "modules/dgca_data.py",
+      "modules/dgca_runtime.py",
+      "tools/summarize_dgca.py",
+      "tools/prepare_cub200.py",
+      "tools/preflight_dgca.py",
+      "tools/smoke_dgca.py",
+      "tools/build_dgca_delivery.py",
+      "tests/test_dgca.py",
+      "README_DGCA.md"
+    ]
+  }
+}

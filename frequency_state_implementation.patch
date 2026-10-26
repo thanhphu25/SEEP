@@ -1,0 +1,2223 @@
+diff --git a/vision_transformer.py b/vision_transformer.py
+--- a/vision_transformer.py
++++ b/vision_transformer.py
+@@ -690,7 +690,7 @@
+             res['prompts'] = unified_prompt
+             return res
+     
+-    def get_Frequency_mask(self, input):
++    def get_Frequency_mask(self, input, frequency_state=None):
+         # Perform Fourier transform on the h and w dimensions
+         fft_im = torch.fft.fftn(input, dim=(-2, -1))  # 2D Fourier transform
+         fft_im_center = torch.fft.fftshift(fft_im, dim=(-2, -1))  # Shift the zero frequency to the center
+@@ -726,7 +726,8 @@
+ 
+         # Weight each ring
+         temperature = getattr(self.args, 'temperature', 1.0)
+-        weights_normalized = torch.softmax(self.weights * temperature, dim=0)  # Normalize the weights
++        selected_weights = self.weights if frequency_state is None else frequency_state['weights']
++        weights_normalized = torch.softmax(selected_weights * temperature, dim=0)  # Normalize the weights
+         weighted_ring_masks = weights_normalized[:, None, None] * ring_masks  # Weighted mask
+         # Sum the weighted masks, get the overall frequency mask
+         final_mask = weighted_ring_masks.sum(dim=0)  # [h, w]
+@@ -740,9 +741,10 @@
+         # Inverse Fourier transform to get back to the image domain
+         ifft_residual = torch.fft.ifftshift(fft_residual, dim=(-2, -1))
+         ifft_residual = torch.fft.ifftn(ifft_residual, dim=(-2, -1))
+-        return input + (torch.abs(ifft_residual) - input) * self.frequency_residual_scale
+-
+-    def forward_features(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None):
++        selected_scale = self.frequency_residual_scale if frequency_state is None else frequency_state['frequency_residual_scale']
++        return input + (torch.abs(ifft_residual) - input) * selected_scale
++
++    def forward_features(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None, frequency_state=None):
+ 
+         if train:
+             if epoch_info >= self.warmup:
+@@ -764,8 +766,10 @@
+                 res = self.get_prompts(x, task_id=learned_id, train=train)  
+                 prompts = res['prompts']
+                 input1 = x + prompts * 1
+-                input2 = self.get_Frequency_mask(x)
+-                x = self.alpha * input1 + self.beta * input2
++                input2 = self.get_Frequency_mask(x, frequency_state=frequency_state)
++                selected_alpha = self.alpha if frequency_state is None else frequency_state['alpha']
++                selected_beta = self.beta if frequency_state is None else frequency_state['beta']
++                x = selected_alpha * input1 + selected_beta * input2
+             elif lgsp_type == 'LSP':
+                 res = self.get_prompts(x, task_id=learned_id, train=train)  
+                 prompts = res['prompts']
+@@ -820,12 +824,13 @@
+         res['pre_logits'] = x
+ 
+         x = self.fc_norm(x)
++        res['classifier_features'] = x
+         
+         res['logits'] = self.head(x)
+         
+         return res
+ 
+-    def forward(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None):
++    def forward(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None, frequency_bank=None):
+         if not train and cls_features is not None:
+             matched_task_id = self.match_task_rainbow_style(cls_features, learned_id)
+             self.matched_task_id = matched_task_id
+@@ -834,7 +839,12 @@
+             # During training, use provided task_id
+             self.matched_task_id = task_id
+         
+-        res = self.forward_features(x, task_id=task_id, learned_id=learned_id, cls_features=cls_features, train=train, epoch_info=epoch_info)
++        frequency_state = None
++        if not train and frequency_bank is not None:
++            if cls_features is None:
++                raise ValueError('Frequency snapshots require the original CLS router')
++            frequency_state = frequency_bank.select(self.matched_task_id, learned_id, x.device)
++        res = self.forward_features(x, task_id=task_id, learned_id=learned_id, cls_features=cls_features, train=train, epoch_info=epoch_info, frequency_state=frequency_state)
+         res = self.forward_head(res)
+         return res
+ 
+@@ -1464,4 +1474,4 @@
+     model_kwargs = dict(
+         patch_size=16, embed_dim=768, depth=18, num_heads=12, init_values=1e-5, block_fn=ParallelBlock, **kwargs)
+     model = _create_vision_transformer('vit_base_patch16_18x2_224', pretrained=pretrained, **model_kwargs)
+-    return model
+\ No newline at end of file
++    return model
+diff --git a/engine.py b/engine.py
+--- a/engine.py
++++ b/engine.py
+@@ -247,7 +247,7 @@
+ 
+ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Module, original_model: torch.nn.Module, 
+                     criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer, lr_scheduler, device: torch.device, 
+-                    class_mask=None, args = None,):
++                    class_mask=None, args = None, boundary_observer=None,):
+ 
+     # create matrix to save end-of-task accuracies 
+     acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
+@@ -327,8 +327,12 @@
+                 lr_scheduler.step(epoch)
+         
+         
++        if boundary_observer is not None:
++            boundary_observer.capture(model_without_ddp, task_id)
+         test_stats = evaluate_till_now(model=model, original_model=original_model, data_loader=data_loader, device=device, 
+                                     task_id=task_id, class_mask=class_mask, acc_matrix=acc_matrix, args=args)
++        if boundary_observer is not None:
++            boundary_observer.evaluate(model_without_ddp, original_model, data_loader, device, task_id, class_mask)
+         if args.output_dir and utils.is_main_process():
+             Path(os.path.join(args.output_dir, 'checkpoint')).mkdir(parents=True, exist_ok=True)
+ 
+@@ -350,4 +354,4 @@
+ 
+         if args.output_dir and utils.is_main_process():
+             with open(os.path.join(args.output_dir, '{}_stats.txt'.format(datetime.datetime.now().strftime('log_%Y_%m_%d_%H_%M'))), 'a') as f:
+-                f.write(json.dumps(log_stats) + '\n')
+\ No newline at end of file
++                f.write(json.dumps(log_stats) + '\n')
+diff --git a/datasets.py b/datasets.py
+--- a/datasets.py
++++ b/datasets.py
+@@ -16,7 +16,6 @@
+ from timm.data import create_transform
+ from PIL import Image, ImageFilter, ImageOps
+ from continual_datasets.continual_datasets import *
+-from continual_datasets.video_datasets import UCF101, ActivityNet
+ 
+ import utils
+ 
+@@ -47,6 +46,11 @@
+     return torch.stack(videos, dim=0), torch.as_tensor(labels, dtype=torch.long)
+ 
+ def build_continual_dataloader(args):
++    # Image experiments do not need a video decoder (not available on all hosts).
++    video_types = ()
++    if args.dataset in ('UCF101', 'ActivityNet', 'Split-UCF101', 'Split-ActivityNet'):
++        from continual_datasets.video_datasets import UCF101, ActivityNet
++        video_types = (ActivityNet, UCF101)
+     dataloader = list()
+     class_mask = list() if args.task_inc or args.train_mask else None
+ 
+@@ -102,7 +106,7 @@
+ 
+         base_train = _unwrap_to_base_dataset(dataset_train)
+         video_collate = (
+-            collate_video if (isinstance(base_train, ActivityNet) or isinstance(base_train, UCF101)) else None
++            collate_video if isinstance(base_train, video_types) else None
+         )
+         
+         # Flattening (B, S, C, H, W) -> (B*S, C, H, W) multiplies per-step activations by S; keep the
+@@ -197,10 +201,12 @@
+         dataset_val = Imagenet_R(args.data_path, train=False, download=True, transform=transform_val).data
+     
+     elif dataset == 'UCF101':
++        from continual_datasets.video_datasets import UCF101
+         dataset_train = UCF101(args.data_path, train=True, num_tasks = args.num_tasks, transform=transform_train)
+         dataset_val   = UCF101(args.data_path, train=False, num_tasks = args.num_tasks, transform=transform_val)
+  
+     elif dataset == 'ActivityNet':
++        from continual_datasets.video_datasets import ActivityNet
+         dataset_train = ActivityNet(args.data_path, train=True, num_tasks = args.num_tasks, transform=transform_train)
+         dataset_val   = ActivityNet(args.data_path, train=False, num_tasks = args.num_tasks, transform=transform_val)
+ 
+diff --git a/continual_datasets/continual_datasets.py b/continual_datasets/continual_datasets.py
+--- a/continual_datasets/continual_datasets.py
++++ b/continual_datasets/continual_datasets.py
+@@ -423,6 +423,12 @@
+         self.transform = transform
+         self.target_transform=target_transform
+         self.train = train
++
++        # Official-split adapters may prepare ImageFolder trees without an archive.
++        prepared = os.path.join(root, 'CUB_200_2011')
++        if all(os.path.isdir(os.path.join(prepared, split)) for split in ('train', 'test')):
++            self.data = datasets.ImageFolder(os.path.join(prepared, 'train' if train else 'test'), transform=transform)
++            return
+ 
+         self.url = 'https://data.deepai.org/CUB200(2011).zip'
+         self.filename = 'CUB200(2011).zip'
+diff --git a/modules/frequency_state.py b/modules/frequency_state.py
+new file mode 100644
+--- /dev/null
++++ b/modules/frequency_state.py
+@@ -0,0 +1,382 @@
++"""Task frequency recall only. No learned parameters, head fitting, or DGCA.
++
++Bank slots are zero based; checkpoint boundaries and inventory entries are one based.
++The bank deliberately stays outside nn.Module and optimizer state.
++"""
++import contextlib
++import copy
++import hashlib
++import inspect
++import json
++import random
++import re
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++
++FIELDS = {'weights': (100,), 'frequency_residual_scale': (), 'alpha': (), 'beta': ()}
++CHANNELS = ('live_raw_exact', 'snapshot_raw_exact', 'live_raw_seen', 'snapshot_raw_seen')
++PROTOCOL = dict(seed=3407, model='vit_base_patch16_224', num_tasks=10, batch_size=32,
++                shuffle=False, lgsp='YES', lgsp_type='LGSP', D1=56, D2=96, epochs=30,
++                dataset='Split-CUB200', task_inc=False, num_r=100, input_size=224,
++                opt='adam', sched='cosine')
++PATH_OVERRIDES = {'data_path', 'output_dir', 'device', 'num_workers', 'pin_mem', 'eval',
++                  'trial', 'print_freq', 'dist_url', 'distributed', 'world_size', 'gpu',
++                  'subparser_name', 'num_tasks_to_run', 'historical_environment', 'effective_lr'}
++
++
++def json_write(path, value):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_suffix(path.suffix + '.tmp')
++    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + '\n', encoding='utf8')
++    temporary.replace(path)
++
++
++def file_sha(path):
++    digest = hashlib.sha256()
++    with open(path, 'rb') as stream:
++        for block in iter(lambda: stream.read(8 * 2**20), b''):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def tensor_hash(state):
++    digest = hashlib.sha256()
++    for name, value in sorted(state.items()):
++        value = value.detach().cpu().contiguous()
++        digest.update((name + str(value.dtype) + str(tuple(value.shape))).encode())
++        digest.update(value.numpy().tobytes())
++    return digest.hexdigest()
++
++
++def state_from(source):
++    state = source.state_dict() if hasattr(source, 'state_dict') else source
++    result = {}
++    for name, shape in FIELDS.items():
++        value = state[name]
++        if value.shape != shape or value.dtype != torch.float32 or not torch.isfinite(value).all():
++            raise ValueError(f'Invalid frequency tensor {name}: shape={value.shape}, dtype={value.dtype}')
++        result[name] = value.detach().cpu().clone()
++    return result
++
++
++class FrequencyBank:
++    def __init__(self):
++        self._slots = {}
++        self.provenance = {}
++
++    def add(self, task, source, provenance):
++        if type(task) is not int or not 0 <= task < 10 or task in self._slots:
++            raise ValueError(f'Invalid/duplicate zero-based bank slot: {task}')
++        self._slots[task] = state_from(source)
++        self.provenance[task] = copy.deepcopy(provenance)
++
++    def select(self, task, horizon, device):
++        if type(task) is not int or not 0 <= task <= horizon < 10 or task not in self._slots:
++            raise ValueError(f'Missing/future frequency slot {task}, horizon={horizon}')
++        # Clones make the public accessor read-only even on CPU.
++        return {k: v.to(device=device).clone() for k, v in self._slots[task].items()}
++
++    def save(self, path):
++        records = []
++        for task, state in sorted(self._slots.items()):
++            previous = self._slots.get(task - 1)
++            records.append(dict(task_zero_based=task, boundary=task + 1,
++                tensors={k: v.tolist() for k, v in state.items()}, sha256=tensor_hash(state),
++                norms={k: float(v.norm()) for k, v in state.items()},
++                delta_from_previous=None if previous is None else
++                    {k: float((v - previous[k]).norm()) for k, v in state.items()},
++                provenance=self.provenance[task]))
++        json_write(path, dict(slots=records, tensor_values=103 * len(records),
++                              tensor_bytes=412 * len(records), dtype='float32', device='cpu'))
++
++
++@contextlib.contextmanager
++def isolated_rng():
++    python_state, numpy_state, cpu = random.getstate(), np.random.get_state(), torch.get_rng_state()
++    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
++    try:
++        yield
++    finally:
++        random.setstate(python_state)
++        np.random.set_state(numpy_state)
++        torch.set_rng_state(cpu)
++        if cuda is not None:
++            torch.cuda.set_rng_state_all(cuda)
++
++
++def load_checkpoint(path, trusted=False):
++    kwargs = dict(map_location='cpu')
++    if 'weights_only' in inspect.signature(torch.load).parameters:
++        kwargs['weights_only'] = not trusted
++    elif not trusted:
++        raise ValueError('This PyTorch cannot safely inspect pickle: set trusted_checkpoints for your own files')
++    try:
++        payload = torch.load(path, **kwargs)
++    except Exception as exc:
++        raise ValueError('Cannot load checkpoint. Namespace pickle requires trusted_checkpoints=true '
++                         'ONLY for your own trusted checkpoints. ' + str(path)) from exc
++    if not isinstance(payload, dict) or not isinstance(payload.get('model'), dict) or not any(k in payload for k in ('args', 'experiment_config')):
++        raise ValueError('Expected SEEP/DGCA dictionary containing model and args: ' + str(path))
++    raw = payload.get('args', payload.get('experiment_config'))
++    args = copy.deepcopy(raw if isinstance(raw, dict) else vars(raw))
++    state = payload['model']
++    if payload.get('format') not in (None, 'SEEP_DGCA_v1'):
++        raise ValueError('Unsupported/enhanced checkpoint format: ' + str(payload['format']))
++    prefixes = [key.startswith('module.') for key in state]
++    stripped = bool(prefixes) and all(prefixes)
++    if any(prefixes) and not stripped:
++        raise ValueError('Mixed DDP and non-DDP state keys')
++    if stripped:
++        state = {key[7:]: value for key, value in state.items()}
++    forbidden = re.compile(r'(^|[._])(cls_steering|ccsr|n1)([._]|$)', re.I)
++    if any(forbidden.search(key) for key in state):
++        raise ValueError('Representation-enhanced checkpoint (CLS Steering/CCSR/N1) is not eligible')
++    for key, value in args.items():
++        if forbidden.search(key) and value not in (None, False, 0, '', 'off', 'none', []):
++            raise ValueError('Representation enhancement flag enabled: ' + key)
++    if args.get('dgca', 'off') not in ('off', 'none', None, 'align_only'):
++        raise ValueError('Only original SEEP or DGCA align_only source checkpoints are supported')
++    if 'dgca' in payload and payload['dgca'].get('config', {}).get('mode') != 'align_only':
++        raise ValueError('DGCA payload must be explicitly align_only')
++    if not all(isinstance(v, torch.Tensor) for v in state.values()):
++        raise ValueError('Non-tensor model state')
++    return payload, state, args, stripped
++
++
++def generators_in(state):
++    ids = sorted({int(m.group(1)) for key in state
++                  if (m := re.match(r'prompt_generators\.(\d+)\.', key))})
++    if ids != list(range(len(ids))):
++        raise ValueError('Non-contiguous CNN generators')
++    return len(ids)
++
++
++def dynamic_strict_load(model, state, boundary):
++    count = generators_in(state)
++    if count != boundary:
++        raise ValueError(f'Boundary {boundary} requires {boundary} CNN generators, found {count}')
++    if len(model.prompt_generators) > count:
++        raise ValueError('Use a fresh model when loading an earlier boundary')
++    with isolated_rng():
++        model.ensure_prompt_generator(count - 1)
++    prompt = state.get('stored_unified_prompts')
++    if prompt is None or prompt.shape != (model.args.num_tasks, 3, model.args.input_size, model.args.input_size):
++        raise ValueError('Missing/invalid runtime stored_unified_prompts shape')
++    device = next(model.parameters()).device
++    if 'stored_unified_prompts' not in model._buffers:
++        delattr(model, 'stored_unified_prompts')
++        model.register_buffer('stored_unified_prompts', torch.empty_like(prompt, device=device))
++    model.load_state_dict(state, strict=True)
++
++
++def config_signature(args):
++    return {k: v for k, v in args.items() if k not in PATH_OVERRIDES
++            and not k.startswith(('dgca', 'frequency_'))}
++
++
++def validate_config(args):
++    missing = [k for k in PROTOCOL if k not in args]
++    if missing:
++        raise ValueError('Cannot verify required saved args: ' + ', '.join(missing))
++    bad = {k: (args[k], v) for k, v in PROTOCOL.items() if args[k] != v}
++    if bad:
++        raise ValueError('Saved protocol mismatch (actual, expected): ' + str(bad))
++    if args.get('class_order', list(range(200))) != list(range(200)):
++        raise ValueError('Class order differs from unshuffled 0..199 protocol')
++    for key, expected in dict(lr_local=.0005, lr_Frequency_mask=.03, reinit_optimizer=True,
++                              train_mask=True, pretrained=True).items():
++        if key in args and args[key] != expected:
++            raise ValueError(f'Saved protocol mismatch {key}={args[key]} expected {expected}')
++
++
++def checkpoint_mapping(root, explicit=None):
++    if explicit:
++        data = json.loads(Path(explicit).read_text(encoding='utf8')) if isinstance(explicit, (str, Path)) else explicit
++        mapping = {int(k): Path(v) for k, v in data.items()}
++        if any(not 1 <= k <= 10 for k in mapping) or len(set(map(str, mapping.values()))) != len(mapping):
++            raise ValueError('Mapping must use unique paths and one-based boundaries 1..10')
++        return mapping
++    candidates = {}
++    for path in sorted(Path(root).rglob('*')):
++        if path.is_file() and path.suffix.lower() in ('.pth', '.pt', '.ckpt'):
++            m = re.search(r'task[_-]?(\d+)[_-]checkpoint', path.stem, re.I)
++            if m and 1 <= int(m[1]) <= 10:
++                candidates.setdefault(int(m[1]), []).append(path)
++    duplicates = {k: list(map(str, v)) for k, v in candidates.items() if len(v) > 1}
++    if duplicates:
++        raise ValueError('Duplicate boundaries; provide explicit checkpoint_map JSON. ' + str(duplicates))
++    return {k: v[0] for k, v in candidates.items()}
++
++
++def inventory(root, output, explicit=None, trusted=False):
++    output = Path(output)
++    report = dict(status='inspecting', boundaries=[], unknown=['source commit/environment unless saved',
++        'same-run identity unless saved; tensor/config consistency is checked'], full_trajectory=False)
++    bank, reference, fixed, frozen, run_id = FrequencyBank(), None, None, None, None
++    try:
++        mapping = checkpoint_mapping(root, explicit)
++        missing = [b for b in range(1, 11) if b not in mapping or not mapping[b].is_file()]
++        report['missing_boundaries'] = missing
++        for boundary in range(1, 11):
++            path = mapping.get(boundary)
++            entry = dict(boundary=boundary, path=str(path) if path else None, status='missing')
++            report['boundaries'].append(entry)
++            if path is None or not path.is_file():
++                continue
++            entry.update(size_bytes=path.stat().st_size, sha256=file_sha(path), status='checking')
++            payload, state, args, stripped = load_checkpoint(path, trusted)
++            # Drop the optimizer and any learned DGCA head immediately, retaining only model tensors.
++            epoch = payload.get('epoch')
++            dgca = payload.get('dgca', {})
++            saved_boundary = payload.get('boundary', dgca.get('completed_boundary') if isinstance(dgca, dict) else None)
++            identity = payload.get('run_id', args.get('run_id'))
++            entry.update(format='dgca_align_only' if 'dgca' in payload else 'seep', epoch=epoch,
++                         args=args, ddp_prefix_stripped=stripped, saved_boundary_zero_based=saved_boundary,
++                         run_id=identity, source_commit=payload.get('source_commit', 'unknown'),
++                         environment=payload.get('environment', 'unknown'))
++            del payload
++            validate_config(args)
++            if 'lr' in args and abs(args['lr'] - .00375) > 1e-12:
++                raise ValueError('Saved LR differs from .00375 after scaling; inspect original training config')
++            entry['learning_rate_verification'] = 'verified saved scaled LR' if 'lr' in args else 'unknown'
++            if epoch is not None and epoch != args['epochs'] - 1:
++                raise ValueError(f'Boundary {boundary}: expected final epoch 29 (zero based), got {epoch}')
++            if epoch is None:
++                if entry['format'] != 'dgca_align_only' or saved_boundary != boundary - 1:
++                    raise ValueError('Final epoch cannot be verified from checkpoint')
++                entry['epoch_verification'] = 'unknown; DGCA completed_boundary marker only'
++            if saved_boundary is not None and saved_boundary != boundary - 1:
++                raise ValueError('Saved boundary disagrees with mapping')
++            if generators_in(state) != boundary:
++                raise ValueError('CNN generator count disagrees with mapped boundary')
++            signature = config_signature(args)
++            if reference is None:
++                reference, run_id = signature, identity
++            elif reference != signature or (run_id is not None and identity != run_id):
++                raise ValueError('Mixed-run/config mismatch across checkpoints')
++            entry['same_run_limitation'] = 'Tensor/config consistency cannot prove common training lineage without run identity'
++            this_fixed = dict(radii=tensor_hash({'radii': state['radii']}), temperature=args.get('temperature', 1.0),
++                              ring_beta=4.0, num_r=args['num_r'], input_size=args['input_size'])
++            if state['radii'].shape != (100,) or state['radii'].dtype != torch.float32 or not torch.isfinite(state['radii']).all():
++                raise ValueError('Invalid fixed radii tensor')
++            prefixes = tuple(args.get('freeze', []))
++            frozen_tensors = {k: v for k, v in state.items() if k.startswith(prefixes)}
++            if not frozen_tensors:
++                raise ValueError('No declared frozen backbone tensors to verify')
++            this_frozen = tensor_hash(frozen_tensors)
++            if fixed is not None and (fixed != this_fixed or frozen != this_frozen):
++                raise ValueError('Fixed frequency config or declared frozen backbone changed')
++            fixed, frozen = this_fixed, this_frozen
++            entry.update(status='validated', frozen_backbone_sha256=frozen, fixed_frequency=this_fixed)
++            bank.add(boundary - 1, state, dict(checkpoint=str(path), checkpoint_sha256=entry['sha256'], boundary=boundary))
++            del state
++        bank.save(output / 'frequency_bank.json')
++        if missing:
++            raise ValueError(f'Missing checkpoint boundaries: {missing}. Add the same-run Input or select train_collect explicitly. '
++                             'A final checkpoint alone cannot recover old states; no automatic training.')
++        report.update(status='validated', full_trajectory=True, same_run_identity='verified' if run_id is not None else 'unknown',
++                      fixed_frequency=fixed, frozen_backbone_sha256=frozen)
++    except Exception as exc:
++        report.update(status='failed', error=str(exc))
++        raise
++    finally:
++        json_write(output / 'checkpoint_inventory.json', report)
++    return report, bank
++
++
++def matrix_metrics(matrix):
++    a = np.asarray(matrix, dtype=np.float64)
++    if a.ndim != 2 or a.shape[0] != a.shape[1]:
++        raise ValueError('Expected square A[eval task, boundary]')
++    n = len(a)
++    if any(np.isfinite(a[i, :i]).any() for i in range(n)):
++        raise ValueError('Future cells must be NaN')
++    completed = [t for t in range(n) if np.isfinite(a[:t + 1, t]).all()]
++    observed = int(np.isfinite(a).sum())
++    full = completed == list(range(n)) and observed == n * (n + 1) // 2
++    result = dict(full_matrix=full, observed_cells=observed, completed_boundaries=[t + 1 for t in completed],
++                  aia=None, final_accuracy=None, final_forgetting=None, old_task_final_mean=None,
++                  old_task_peak_mean=None, diagonal_initial_mean=None, bwt=None)
++    if not full:
++        return result
++    peaks = np.array([a[i, i:].max() for i in range(n)])
++    result.update(aia=float(np.mean([a[:t + 1, t].mean() for t in range(n)])),
++                  final_accuracy=float(a[:, -1].mean()), final_forgetting=float((peaks[:-1] - a[:-1, -1]).mean()),
++                  old_task_final_mean=float(a[:-1, -1].mean()), old_task_peak_mean=float(peaks[:-1].mean()),
++                  diagonal_initial_mean=float(np.diag(a).mean()), bwt=float((a[:-1, -1] - np.diag(a)[:-1]).mean()))
++    return result
++
++
++@torch.no_grad()
++def paired_evaluate(model, original, loaders, device, boundary, masks, bank, matrices, progress=print):
++    before = dict(model=tensor_hash(model.state_dict()), original=tensor_hash(original.state_dict()))
++    modes = [(m, m.training) for root in (model, original) for m in root.modules()]
++    attrs = [(obj, key, hasattr(obj, key), getattr(obj, key, None))
++             for obj in (model, getattr(model, 'rainbow_prompt', model))
++             for key in ('task_id', 'matched_task_id', 'e_prefix_feature')]
++    routes, diagnostics = [], []
++    start, processed, total = time.perf_counter(), 0, sum(len(loaders[i]['val'].dataset) for i in range(boundary + 1))
++    try:
++        with isolated_rng():
++            model.eval()
++            original.eval()
++            seen = torch.zeros(model.head.out_features, dtype=torch.bool, device=device)
++            seen[sum((list(masks[i]) for i in range(boundary + 1)), [])] = True
++            for task in range(boundary + 1):
++                loader = loaders[task]['val']
++                if loader.batch_size != 32 or loader.drop_last or not isinstance(loader.sampler, torch.utils.data.SequentialSampler):
++                    raise ValueError('Evaluation requires per-task sequential batches of 32, drop_last=False')
++                correct = {name: 0 for name in CHANNELS}
++                count, route_counts, max_logit, max_feature = 0, {}, 0., 0.
++                for batch, (images, target) in enumerate(loader):
++                    images, target = images.to(device), target.to(device)
++                    cls = original(images)['pre_logits']
++                    live = model(images, task_id=-1, learned_id=boundary, cls_features=cls, train=False)
++                    route = model.matched_task_id
++                    snap = model(images, task_id=-1, learned_id=boundary, cls_features=cls, train=False, frequency_bank=bank)
++                    if route != model.matched_task_id or not 0 <= route <= boundary:
++                        raise AssertionError('Paired route disagreement or future route')
++                    for branch, out in (('live', live), ('snapshot', snap)):
++                        logits = out['logits']
++                        if not torch.isfinite(logits).all() or not torch.isfinite(out['classifier_features']).all():
++                            raise ValueError('Non-finite paired output')
++                        correct[branch + '_raw_exact'] += int((logits.argmax(1) == target).sum())
++                        correct[branch + '_raw_seen'] += int((logits.masked_fill(~seen[None], -torch.inf).argmax(1) == target).sum())
++                    max_logit = max(max_logit, float((live['logits'] - snap['logits']).abs().max()))
++                    max_feature = max(max_feature, float((live['classifier_features'] - snap['classifier_features']).abs().max()))
++                    route_counts[route] = route_counts.get(route, dict(batches=0, images=0))
++                    route_counts[route]['batches'] += 1
++                    route_counts[route]['images'] += len(target)
++                    count += len(target)
++                    processed += len(target)
++                    if batch % 10 == 0 or count == len(loader.dataset):
++                        elapsed = time.perf_counter() - start
++                        progress(f'boundary={boundary+1}/10 eval_task={task+1} processed={count}/{len(loader.dataset)} '
++                                 f'elapsed={elapsed:.1f}s ETA_boundary={elapsed*(total-processed)/max(processed,1):.1f}s')
++                if count != len(loader.dataset) or not count:
++                    raise ValueError('Incomplete/empty validation task')
++                for name in CHANNELS:
++                    if np.isfinite(matrices[name][task, boundary]):
++                        raise ValueError('Refusing to overwrite previously committed metric')
++                    matrices[name][task, boundary] = 100. * correct[name] / count
++                routes.append(dict(boundary=boundary + 1, eval_task=task + 1, count=count, routes=route_counts))
++                diagnostics.append(dict(boundary=boundary + 1, eval_task=task + 1,
++                                        max_abs_logit_delta=max_logit, max_abs_classifier_feature_delta=max_feature))
++    finally:
++        for module, mode in modes:
++            module.training = mode
++        for obj, key, exists, value in attrs:
++            if exists:
++                setattr(obj, key, value)
++            elif hasattr(obj, key):
++                delattr(obj, key)
++    after = dict(model=tensor_hash(model.state_dict()), original=tensor_hash(original.state_dict()))
++    check = dict(boundary=boundary + 1, before=before, after=after, passed=before == after,
++                 restored_modes=True, restored_routing=True)
++    if not check['passed']:
++        raise AssertionError('Paired evaluation mutated checkpoint/router/cache/head tensors')
++    return routes, diagnostics, check
+diff --git a/tools/frequency_setup.py b/tools/frequency_setup.py
+new file mode 100644
+--- /dev/null
++++ b/tools/frequency_setup.py
+@@ -0,0 +1,101 @@
++"""Kaggle setup utilities. Reuses only the verified DGCA CUB adapter/preparation.
++
++No torch/torchvision installation and no representation enhancement modules.
++"""
++import hashlib
++import importlib.metadata
++import json
++import subprocess
++import sys
++import urllib.request
++import zipfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++NPZ_SHA = 'ac7478131e1b77e5c2f0225849730bd19ee89cfffe600c2dfd2272b34a50a43d'
++NPZ_URL = 'https://storage.googleapis.com/vit_models/imagenet21k/ViT-B_16.npz'
++DGCA_SHA = 'ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e'
++
++
++def shim_timm_text(text):
++    text = text.replace('from dataclasses import dataclass, replace\n',
++                        'from dataclasses import dataclass, replace, field\n')
++    for member, kind in (('conv_cfg', 'MaxxVitConvCfg'), ('transformer_cfg', 'MaxxVitTransformerCfg')):
++        text = text.replace(f'{member}: {kind} = {kind}()\n',
++                            f'{member}: {kind} = field(default_factory={kind})\n')
++    return text
++
++
++def dependencies(output):
++    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-deps', 'timm==0.6.11'])
++    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'loguru', 'pytest', 'pyyaml', 'kagglehub'])
++    path = Path(importlib.metadata.distribution('timm').locate_file('timm/models/maxxvit.py'))
++    old = path.read_text(encoding='utf8')
++    new = shim_timm_text(old)
++    assert shim_timm_text(new) == new
++    if new != old:
++        path.write_text(new, encoding='utf8')
++    report = dict(file=str(path), before_sha256=hashlib.sha256(old.encode()).hexdigest(),
++                  after_sha256=hashlib.sha256(new.encode()).hexdigest(), idempotent=True)
++    (Path(output) / 'timm_compatibility.json').write_text(json.dumps(report, indent=2), encoding='utf8')
++    subprocess.check_call([sys.executable, '-c', "import timm,torch,torchvision; print(timm.__version__, torch.__version__, torchvision.__version__)"])
++
++
++def find_official(base):
++    return sorted({p.parent for p in Path(base).rglob('images.txt') if
++        all((p.parent / name).is_file() for name in ('image_class_labels.txt', 'train_test_split.txt'))
++        and (p.parent / 'images').is_dir()})
++
++
++def prepare_data(source, ready, handle='trungkiennguyn/lgsp-dataset'):
++    from tools.prepare_cub200 import prepare
++    if source is None:
++        candidates = find_official('/kaggle/input')
++        if not candidates:
++            import kagglehub
++            try:
++                downloaded = kagglehub.dataset_download(handle)
++                candidates = find_official(downloaded)
++            except Exception as exc:
++                raise RuntimeError('Add Input ' + handle + ' (also for background Save Version). '
++                                   'Official images.txt, image_class_labels.txt and train_test_split.txt are required.') from exc
++        if len(candidates) != 1:
++            raise ValueError(f'Found {len(candidates)} official CUB roots. Set DATA_ROOT explicitly; no random split. {candidates}')
++        source = candidates[0]
++    manifest = prepare(source, ready)
++    reference = json.loads((ROOT / 'references/align_only_seed3407/official_split_manifest.json').read_text(encoding='utf8'))
++    if manifest['official_metadata_sha256'] != reference['official_metadata_sha256']:
++        raise ValueError('Official metadata SHA256 differs from verified ZIP run')
++    return manifest
++
++
++def pretrained(path, output):
++    from modules.frequency_state import file_sha, json_write
++    path = Path(path)
++    if not path.exists():
++        path.parent.mkdir(parents=True, exist_ok=True)
++        temporary = path.with_suffix('.download')
++        urllib.request.urlretrieve(NPZ_URL, temporary)
++        if file_sha(temporary) != NPZ_SHA:
++            raise ValueError('Downloaded NPZ SHA256 mismatch')
++        temporary.replace(path)
++    actual = file_sha(path)
++    if actual != NPZ_SHA:
++        raise ValueError('Pretrained NPZ SHA256 mismatch')
++    json_write(Path(output) / 'pretrained_manifest.json', dict(path=str(path), url=NPZ_URL, sha256=actual))
++    return path
++
++
++def export(output, destination=None):
++    output = Path(output)
++    destination = Path(destination or output.parent / 'SEEP_FREQUENCY_STATE_CUB200_metrics.zip')
++    # Explicit allowlist by suffix; no pickle/checkpoints, image data, or full model states.
++    allowed = {'.json', '.csv', '.txt', '.log', '.patch', '.md', '.ipynb', '.xml'}
++    with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:
++        for path in sorted(output.rglob('*')):
++            if path.is_file() and path.suffix.lower() in allowed and 'checkpoint' not in path.relative_to(output).parts:
++                archive.write(path, str(path.relative_to(output)).replace('\\', '/'))
++    return destination
+diff --git a/tools/frequency_run.py b/tools/frequency_run.py
+new file mode 100644
+--- /dev/null
++++ b/tools/frequency_run.py
+@@ -0,0 +1,373 @@
++"""Paired raw SEEP frequency-state evaluation; reeval never builds an optimizer."""
++import argparse
++import csv
++import gc
++import json
++import platform
++import shutil
++import subprocess
++import sys
++import time
++import traceback
++from pathlib import Path
++from types import SimpleNamespace
++
++ROOT = Path(__file__).resolve().parents[1]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++import numpy as np
++import torch
++from modules.frequency_state import (CHANNELS, FrequencyBank, dynamic_strict_load, file_sha,
++    inventory, isolated_rng, json_write, load_checkpoint, matrix_metrics, paired_evaluate,
++    tensor_hash, validate_config)
++from tools.frequency_setup import export, pretrained, NPZ_SHA, DGCA_SHA
++
++BASE = '80081081ab42769d102f83d447705da0639e2fb1'
++
++
++def default_args():
++    from configs.cub200_10task import get_args_parser
++    parser = argparse.ArgumentParser()
++    get_args_parser(parser)
++    args = parser.parse_args([])
++    args.seed, args.distributed, args.nb_classes = 3407, False, 200
++    return args
++
++
++def require_gpu(args):
++    if not str(args.device).startswith('cuda') or not torch.cuda.is_available():
++        raise ValueError('Full CUB protocol requires Kaggle GPU; CPU unit tests are not an experiment')
++
++
++def environment_freeze():
++    result = subprocess.run([sys.executable, '-m', 'pip', 'freeze'], capture_output=True)
++    if result.returncode == 0:
++        return result.stdout
++    import importlib.metadata
++    packages = sorted(f"{d.metadata['Name']}=={d.version}" for d in importlib.metadata.distributions() if d.metadata['Name'])
++    return ('# pip unavailable; installed distributions from importlib.metadata\n' + '\n'.join(packages) + '\n').encode()
++
++
++def build_models(args, npz):
++    from timm.models import create_model
++    import models  # register SEEP ViT, not timm's stock ViT
++    common = dict(pretrained=False, num_classes=args.nb_classes, drop_rate=args.drop,
++                  drop_path_rate=args.drop_path, drop_block_rate=None)
++    original = create_model(args.model, **common)
++    options = dict(prompt_length=args.length, embedding_key=args.embedding_key, prompt_init=args.prompt_key_init,
++        prompt_pool=args.prompt_pool, prompt_key=args.prompt_key, pool_size=args.size, top_k=args.top_k,
++        batchwise_prompt=args.batchwise_prompt, prompt_key_init=args.prompt_key_init, head_type=args.head_type,
++        use_prompt_mask=args.use_prompt_mask, use_g_prompt=args.use_g_prompt, g_prompt_length=args.g_prompt_length,
++        g_prompt_layer_idx=args.g_prompt_layer_idx, use_prefix_tune_for_g_prompt=args.use_prefix_tune_for_g_prompt,
++        use_e_prompt=args.use_e_prompt, e_prompt_layer_idx=args.e_prompt_layer_idx,
++        use_prefix_tune_for_e_prompt=args.use_prefix_tune_for_e_prompt, same_key_value=args.same_key_value,
++        n_tasks=args.num_tasks, D1=args.D1, D2=args.D2, relation_type=args.relation_type,
++        use_linear=args.use_linear, warm_up=args.warm_up, KI_iter=args.KI_iter, self_attn_idx=args.self_attn_idx, args=args)
++    model = create_model(args.model, **common, **options)
++    # Same custom NPZ loader as pretrained=True in pinned SEEP/timm, with verified local file.
++    original.load_pretrained(str(npz))
++    model.load_pretrained(str(npz))
++    with np.load(npz) as weights:
++        prefix = 'opt/target/' if 'opt/target/embedding/kernel' in weights else ''
++        kernel = torch.from_numpy(weights[prefix + 'embedding/kernel'].transpose(3, 2, 0, 1))
++        for loaded in (original, model):
++            torch.testing.assert_close(loaded.patch_embed.proj.weight.detach().cpu(), kernel, rtol=0, atol=0)
++    original.requires_grad_(False)
++    for name, param in model.named_parameters():
++        if name.startswith(tuple(args.freeze)):
++            param.requires_grad_(False)
++    return model, original
++
++
++def split_manifest(loaders, masks, args):
++    from torch.utils.data import Subset
++    tasks = []
++    for task in loaders:
++        entry = {}
++        for split in ('train', 'val'):
++            base = task[split].dataset
++            indices = list(range(len(base)))
++            while isinstance(base, Subset):
++                indices = [int(base.indices[i]) for i in indices]
++                base = base.dataset
++            samples = base.samples
++            entry[split] = [dict(index=i, label=int(base.targets[i]),
++                                path=Path(samples[i][0]).parent.name + '/' + Path(samples[i][0]).name) for i in indices]
++        tasks.append(entry)
++    value = dict(class_mask=masks, tasks=tasks, batch_size=32, stats_sampler='sequential', stats_drop_last=False)
++    import hashlib
++    digest = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++    if masks != [list(range(t * 20, (t + 1) * 20)) for t in range(10)]:
++        raise ValueError('Unexpected class order')
++    if sum(len(t['train']) for t in tasks) != 5994 or sum(len(t['val']) for t in tasks) != 5794:
++        raise ValueError('Official CUB counts differ')
++    return dict(**value, sha256=digest, train_transform=str(loaders[0]['train'].dataset.dataset.transform),
++                val_transform=str(loaders[0]['val'].dataset.dataset.transform))
++
++
++def verify_original(model, original, args):
++    if any(p.requires_grad for p in original.parameters()):
++        raise ValueError('Original routing ViT is not frozen')
++    state, raw = model.state_dict(), original.state_dict()
++    shared = [k for k in raw if k in state and k.startswith(tuple(args.freeze))]
++    if not shared or any(not torch.equal(state[k].cpu(), raw[k].cpu()) for k in shared):
++        raise ValueError('Checkpoint frozen backbone disagrees with verified routing NPZ. Investigate pretrained/source.')
++    return dict(frozen=True, compared_tensors=len(shared), frozen_tensors_sha256=tensor_hash({k: raw[k] for k in shared}),
++                routing_representation_sha256=tensor_hash({k: v for k, v in raw.items() if not k.startswith('head.')}),
++                pretrained_sha256=NPZ_SHA)
++
++
++def dgca_representation_hash(original):
++    """Exact hash serialization used by the supplied ZIP (not a learned DGCA module)."""
++    import hashlib
++    digest = hashlib.sha256()
++    for key, value in sorted(original.state_dict().items()):
++        if key.startswith('head.'):
++            continue
++        value = value.detach().cpu().contiguous()
++        inner = hashlib.sha256(str((value.dtype, tuple(value.shape))).encode())
++        inner.update(value.numpy().tobytes())
++        digest.update(key.encode())
++        digest.update(inner.hexdigest().encode())
++    return digest.hexdigest()
++
++
++def write_metrics(output, matrices, process_success=False, checks_pass=False):
++    output = Path(output)
++    metrics = {}
++    for name, matrix in matrices.items():
++        np.savetxt(output / f'task_accuracy_matrix_{name}.csv', matrix, delimiter=',', fmt='%.17g')
++        # Recompute from saved bytes so exported metrics never depend on in-memory rounding.
++        matrix = np.loadtxt(output / f'task_accuracy_matrix_{name}.csv', delimiter=',')
++        metrics[name] = matrix_metrics(matrix)
++        with (output / f'per_task_{name}.csv').open('w', newline='', encoding='utf8') as stream:
++            writer = csv.writer(stream)
++            writer.writerow(['task', 'initial', 'peak_observed', 'final'])
++            for i in range(10):
++                row = matrix[i, i:]
++                writer.writerow([i + 1, '' if not np.isfinite(matrix[i, i]) else matrix[i, i],
++                    '' if not np.isfinite(row).any() else np.nanmax(row),
++                    '' if not np.isfinite(matrix[i, -1]) else matrix[i, -1]])
++    full = all(m['full_matrix'] and m['observed_cells'] == 55 for m in metrics.values())
++    complete = bool(full and process_success and checks_pass)
++    deltas = {}
++    for channel in ('raw_exact', 'raw_seen'):
++        live, snap = metrics['live_' + channel], metrics['snapshot_' + channel]
++        deltas[channel] = {k: None if live[k] is None else snap[k] - live[k]
++            for k in ('aia', 'final_accuracy', 'final_forgetting', 'old_task_final_mean', 'old_task_peak_mean', 'diagonal_initial_mean', 'bwt')}
++    primary = deltas['raw_exact']
++    signal = (primary['aia'] >= .3 and primary['final_accuracy'] > 0 and primary['old_task_final_mean'] > 0) if complete else None
++    summary = dict(full_protocol_complete=complete, process_success=process_success, checks_pass=checks_pass,
++        metrics=metrics, snapshot_minus_live_percentage_points=deltas, screening_signal=signal,
++        forgetting_goal=None if signal is None else bool(signal and primary['final_forgetting'] < 0),
++        primary='paired raw_exact on the same checkpoint trajectory',
++        interpretation='One seed; screening rule is not statistical significance. Inspect peaks with forgetting. '
++        'No test-based state tuning or novelty/zero-forgetting claim.',
++        historical_reference_only=dict(original=[87.5441, 86.4980, 2.9515],
++            align_only_raw=[87.67822862125138, 86.4383690615546, 3.3992381159689904]))
++    json_write(output / 'summary.json', summary)
++    with (output / 'comparison.csv').open('w', newline='', encoding='utf8') as stream:
++        writer = csv.writer(stream)
++        writer.writerow(['channel', 'metric', 'live', 'snapshot', 'snapshot_minus_live_pp'])
++        for channel, delta in deltas.items():
++            for key, value in delta.items():
++                writer.writerow([channel, key, metrics['live_' + channel][key], metrics['snapshot_' + channel][key], value])
++    return summary
++
++
++def compare_source(entry, payload, matrices, output):
++    reference = payload.get('matrices', {}).get('raw_exact')
++    records = json.loads((output / 'source_accuracy_comparison.json').read_text()) if (output / 'source_accuracy_comparison.json').exists() else []
++    b = entry['boundary'] - 1
++    comparison = dict(boundary=b + 1, source='saved checkpoint raw_exact matrix', available=reference is not None,
++        limitations='No substitution of historical values. Differences can arise from source/transforms/pretrained/batching; '
++                     'inspect manifests. Missing metadata remains unknown.')
++    if reference is not None:
++        ref = np.asarray(reference)[:b + 1, b]
++        comparison.update(saved=ref.tolist(), reeval=matrices['live_raw_exact'][:b + 1, b].tolist(),
++                          delta_pp=(matrices['live_raw_exact'][:b + 1, b] - ref).tolist())
++    records.append(comparison)
++    json_write(output / 'source_accuracy_comparison.json', records)
++
++
++def preflight(config):
++    output = Path(config['output'])
++    if config['run_mode'] == 'reeval':
++        report, bank = inventory(config['checkpoint_root'], output, config.get('checkpoint_map'), config['trusted_checkpoints'])
++        for e in report['boundaries']:
++            print(f"boundary={e['boundary']:2d} {e['status']:10s} epoch={e.get('epoch')} size={e.get('size_bytes',0)/2**20:.1f}MiB {e['path']}")
++        return report, bank
++    if config['run_mode'] != 'train_collect':
++        raise ValueError('run_mode must be reeval or train_collect')
++    # Fresh run only; never resume silently from final checkpoint or overwrite old metrics/bank.
++    if (output / 'checkpoint').exists() or (output / 'frequency_bank.json').exists():
++        raise ValueError('train_collect requires a fresh output. Interrupted collected checkpoints remain usable for explicit reeval; '
++                         'training resume is intentionally unsupported, so boundary metrics/snapshots cannot duplicate.')
++    json_write(output / 'checkpoint_inventory.json', dict(status='new_train_collect', missing_boundaries=list(range(1, 11)),
++        full_trajectory=False, note='New full 10x30 run. No final-checkpoint resume.'))
++    return None, FrequencyBank()
++
++
++class Collector:
++    def __init__(self, output, matrices, bank):
++        self.output, self.matrices, self.bank = output, matrices, bank
++        self.routes, self.diagnostics, self.checks = [], [], []
++
++    def capture(self, model, task):
++        with isolated_rng():
++            self.bank.add(task, model, dict(boundary=task + 1, source='after final optimizer/scheduler, before evaluation'))
++            self.bank.save(self.output / 'frequency_bank.json')
++
++    def evaluate(self, model, original, loaders, device, task, masks):
++        # Includes data-loader base-seed consumption in isolated_rng so collector changes no training RNG.
++        routes, diagnostics, check = paired_evaluate(model, original, loaders, device, task, masks, self.bank, self.matrices)
++        self.routes.extend(routes)
++        self.diagnostics.extend(diagnostics)
++        self.checks.append(check)
++        json_write(self.output / 'route_counts.json', self.routes)
++        json_write(self.output / 'paired_diagnostics.json', self.diagnostics)
++        json_write(self.output / 'mutation_checks.json', self.checks)
++        write_metrics(self.output, self.matrices)
++
++
++def run(config, check_only=False):
++    from datasets import build_continual_dataloader
++    from main import initialize_experiment
++    output = Path(config['output'])
++    output.mkdir(parents=True, exist_ok=True)
++    if not check_only and any(output.glob('task_accuracy_matrix_*.csv')):
++        raise ValueError('Use a fresh output; existing metrics will not be overwritten')
++    start = time.perf_counter()
++    matrices = {name: np.full((10, 10), np.nan, dtype=np.float64) for name in CHANNELS}
++    json_write(output / 'run_status.json', dict(status='running', phase='preflight', full_protocol_complete=False))
++    try:
++        report, bank = preflight(config)
++        args = SimpleNamespace(**report['boundaries'][0]['args']) if report else default_args()
++        saved = vars(args).copy()
++        overrides = dict(data_path=str(config['data_path']).rstrip('/\\') + '/', output_dir=str(output),
++                         device=config.get('device', 'cuda:0'), num_workers=config.get('num_workers', 4),
++                         pin_mem=config.get('pin_mem', getattr(args, 'pin_mem', True)),
++                         print_freq=config.get('print_freq', getattr(args, 'print_freq', 100)),
++                         distributed=False, world_size=1, eval=config['run_mode'] == 'reeval', num_tasks_to_run=0)
++        for key, value in overrides.items():
++            setattr(args, key, value)
++        args.nb_classes = getattr(args, 'nb_classes', 200)
++        validate_config(vars(args))
++        if config['run_mode'] == 'train_collect':
++            # Scale the fresh CLI LR ONCE, exactly as main.py. Saved reeval args never scale.
++            args.lr *= args.batch_size / 256.
++        initialize_experiment(args.seed)
++        # Preserve pinned main.py execution policy; log actual behavior.
++        torch.backends.cudnn.benchmark = True
++        npz = pretrained(config['npz_path'], output)
++        loaders, masks = build_continual_dataloader(args)
++        split = split_manifest(loaders, masks, args)
++        json_write(output / 'split_manifest.json', split)
++        reference = json.loads((ROOT / 'references/align_only_seed3407/provenance.json').read_text())
++        if reference.get('split_sha256') and split['sha256'] != reference['split_sha256']:
++            raise ValueError('Prepared task split differs from verified run')
++        model, original = build_models(args, npz)
++        json_write(output / 'run_config.json', dict(mode=config['run_mode'], saved_args=saved, actual_args=vars(args),
++            path_overrides=overrides, optimizer_created=config['run_mode'] == 'train_collect', lr_rescaled=report is None,
++            class_order=list(range(200)), cudnn_benchmark=torch.backends.cudnn.benchmark))
++        import torchvision, timm
++        json_write(output / 'environment.json', dict(python=sys.version, platform=platform.platform(), torch=torch.__version__,
++            torchvision=torchvision.__version__, timm=timm.__version__, cuda=torch.version.cuda,
++            gpu=torch.cuda.get_device_name() if torch.cuda.is_available() else None))
++        (output / 'pip_freeze.txt').write_bytes(environment_freeze())
++        if report:
++            entry = report['boundaries'][0]
++            if file_sha(entry['path']) != entry['sha256']:
++                raise ValueError('Source checkpoint changed after inventory')
++            payload, state, _, _ = load_checkpoint(entry['path'], config['trusted_checkpoints'])
++            del payload
++            dynamic_strict_load(model, state, 1)
++            del state
++        verification = verify_original(model, original, args)
++        json_write(output / 'routing_pretrained_verification.json', verification)
++        tests = json.loads((output / 'tests_result.json').read_text())
++        if tests.get('returncode') != 0:
++            raise ValueError('Required implementation tests have not passed')
++        require_gpu(args)
++        json_write(output / 'preflight_results.json', dict(passed=True, checks=['protocol', 'official_split', 'NPZ_SHA256',
++            'strict_dynamic_first_checkpoint' if report else 'fresh_run', 'frozen_original', 'tests', 'GPU'],
++            elapsed_seconds=time.perf_counter() - start))
++        if check_only:
++            json_write(output / 'run_status.json', dict(status='preflight_passed', full_protocol_complete=False))
++            return
++        device = torch.device(args.device)
++        model.to(device)
++        original.to(device)
++        observer = Collector(output, matrices, bank)
++        boundary_times = []
++        if report:
++            # Single checkpoint payload at a time, never ten optimizer states in RAM.
++            for entry in report['boundaries']:
++                tick = time.perf_counter()
++                if file_sha(entry['path']) != entry['sha256']:
++                    raise ValueError('Checkpoint changed after preflight')
++                payload, state, _, _ = load_checkpoint(entry['path'], config['trusted_checkpoints'])
++                source_matrix = payload.get('matrices', {}).get('raw_exact')
++                source_original = payload.get('original_representation_sha256')
++                del payload
++                if source_original is not None and source_original != dgca_representation_hash(original):
++                    raise ValueError('Saved routing ViT hash does not match verified NPZ representation')
++                dynamic_strict_load(model, state, entry['boundary'])
++                del state
++                gc.collect()
++                verify_original(model, original, args)
++                observer.evaluate(model, original, loaders, device, entry['boundary'] - 1, masks)
++                compare_source(entry, dict(matrices={} if source_matrix is None else dict(raw_exact=source_matrix)), matrices, output)
++                boundary_times.append(dict(boundary=entry['boundary'], seconds=time.perf_counter() - tick))
++                elapsed = time.perf_counter() - start
++                done = entry['boundary'] * (entry['boundary'] + 1) / 2
++                print(f"boundary={entry['boundary']}/10 complete elapsed={elapsed:.1f}s ETA_run={elapsed*(55-done)/done:.1f}s", flush=True)
++                json_write(output / 'timing.json', dict(boundaries=boundary_times, elapsed_seconds=elapsed))
++        else:
++            from engine import train_and_evaluate
++            from timm.optim import create_optimizer
++            from timm.scheduler import create_scheduler
++            optimizer = create_optimizer(args, model)
++            scheduler = create_scheduler(args, optimizer)[0] if args.sched != 'constant' else None
++            train_and_evaluate(model, model, original, torch.nn.CrossEntropyLoss().to(device), loaders,
++                optimizer, scheduler, device, class_mask=masks, args=args, boundary_observer=observer)
++            # Reinspect actual emitted checkpoints and verify snapshots came from their own boundary.
++            report, extracted = inventory(output / 'checkpoint', output, trusted=True)
++            for task in range(10):
++                if tensor_hash(bank.select(task, 9, 'cpu')) != tensor_hash(extracted.select(task, 9, 'cpu')):
++                    raise ValueError('Collected snapshot differs from emitted checkpoint boundary')
++            extracted.save(output / 'frequency_bank.json')
++        checks_pass = len(observer.checks) == 10 and all(c['passed'] for c in observer.checks)
++        summary = write_metrics(output, matrices, process_success=True, checks_pass=checks_pass)
++        if not summary['full_protocol_complete']:
++            raise ValueError('Incomplete protocol after evaluation')
++        json_write(output / 'timing.json', dict(boundaries=boundary_times, elapsed_seconds=time.perf_counter() - start))
++        json_write(output / 'run_status.json', dict(status='complete', full_protocol_complete=True, process_returncode=0))
++    except BaseException as exc:
++        # Preserve partial matrices; never claim full completion on exception/interrupt.
++        write_metrics(output, matrices, process_success=False, checks_pass=False)
++        json_write(output / 'run_status.json', dict(status='failed', error=str(exc), full_protocol_complete=False, process_returncode=1))
++        json_write(output / 'timing.json', dict(elapsed_seconds=time.perf_counter() - start))
++        traceback.print_exc()
++        raise
++    finally:
++        try:
++            export(output)
++        except BaseException as exc:
++            write_metrics(output, matrices, process_success=False, checks_pass=False)
++            json_write(output / 'run_status.json', dict(status='failed', error='Export failed: ' + str(exc), full_protocol_complete=False))
++            raise
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(__doc__)
++    parser.add_argument('--config', type=Path, required=True)
++    parser.add_argument('--preflight-only', action='store_true')
++    parser.add_argument('--inventory-only', action='store_true')
++    cli = parser.parse_args()
++    config = json.loads(cli.config.read_text(encoding='utf8'))
++    if cli.inventory_only:
++        preflight(config)
++    else:
++        run(config, cli.preflight_only)
+diff --git a/tools/prepare_cub200.py b/tools/prepare_cub200.py
+new file mode 100644
+--- /dev/null
++++ b/tools/prepare_cub200.py
+@@ -0,0 +1,82 @@
++"""Validate all CUB-200-2011 official records and build SEEP ImageFolder trees."""
++import argparse
++import hashlib
++import json
++import shutil
++from pathlib import Path
++
++
++def read_records(path):
++    result = {}
++    for line in Path(path).read_text(encoding='utf-8').splitlines():
++        key, value = line.strip().split(maxsplit=1)
++        key = int(key)
++        if key in result:
++            raise ValueError(f'Duplicate id {key}: {path}')
++        result[key] = value
++    return result
++
++
++def validate_official(root):
++    root = Path(root)
++    images = read_records(root/'images.txt')
++    labels = {i: int(v) for i, v in read_records(root/'image_class_labels.txt').items()}
++    split = {i: int(v) for i, v in read_records(root/'train_test_split.txt').items()}
++    expected = set(range(1, 11789))
++    if set(images) != expected or set(labels) != expected or set(split) != expected:
++        raise ValueError('Official metadata must contain matching ids 1..11788')
++    if set(labels.values()) != set(range(1, 201)) or set(split.values()) != {0, 1}:
++        raise ValueError('Expected 200 classes and binary official split')
++    if sum(split.values()) != 5994:
++        raise ValueError('Expected official counts: train=5994/test=5794')
++    if len(set(images.values())) != 11788:
++        raise ValueError('Duplicate image paths')
++    for i, relative in images.items():
++        path = Path(relative)
++        if path.is_absolute() or '..' in path.parts or len(path.parts) != 2:
++            raise ValueError('Invalid image path: '+relative)
++        if int(path.parts[0].split('.')[0]) != labels[i]:
++            raise ValueError(f'Label/path mismatch for image {i}')
++        if not (root/'images'/path).is_file():
++            raise FileNotFoundError(root/'images'/path)
++    if len({Path(p).parts[0] for p in images.values()}) != 200:
++        raise ValueError('Expected exactly 200 class directories')
++    metadata = {name: hashlib.sha256((root/name).read_bytes()).hexdigest()
++                for name in ('images.txt', 'image_class_labels.txt', 'train_test_split.txt')}
++    return images, labels, split, metadata
++
++
++def prepare(root, output):
++    root, output = Path(root).resolve(), Path(output).resolve()
++    images, labels, split, metadata = validate_official(root)
++    manifest = {'source': str(root), 'image_count': len(images), 'train': 5994, 'test': 5794,
++                'classes': 200, 'official_metadata_sha256': metadata}
++    output.mkdir(parents=True, exist_ok=True)
++    target_root = output/'CUB_200_2011'
++    target_root.mkdir(exist_ok=True)
++    for i, relative in images.items():
++        target = target_root/('train' if split[i] else 'test')/relative
++        source = root/'images'/relative
++        target.parent.mkdir(parents=True, exist_ok=True)
++        if target.exists():
++            if target.resolve() != source.resolve():
++                raise FileExistsError(f'Existing file is not the official source: {target}')
++        else:
++            target.symlink_to(source)
++    expected = {str(Path('train' if split[i] else 'test')/path) for i, path in images.items()}
++    actual = {str(path.relative_to(target_root)) for scope in ('train', 'test')
++              for path in (target_root/scope).rglob('*') if path.is_file()}
++    if actual != expected:
++        raise ValueError('Prepared split includes missing/extra files')
++    for name in metadata:
++        shutil.copyfile(root/name, target_root/name)
++    (output/'official_split_manifest.json').write_text(json.dumps(manifest, indent=2)+'\n', encoding='utf-8')
++    return manifest
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(__doc__)
++    parser.add_argument('--source', type=Path, required=True)
++    parser.add_argument('--output', type=Path, required=True)
++    args = parser.parse_args()
++    print(json.dumps(prepare(args.source, args.output), indent=2))
+diff --git a/tools/build_frequency_delivery.py b/tools/build_frequency_delivery.py
+new file mode 100644
+--- /dev/null
++++ b/tools/build_frequency_delivery.py
+@@ -0,0 +1,225 @@
++"""Build a standalone Kaggle notebook from LF source files against the pinned base."""
++import base64
++import difflib
++import hashlib
++import json
++import subprocess
++import textwrap
++import zipfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++BASE = '80081081ab42769d102f83d447705da0639e2fb1'
++SOURCES = ['vision_transformer.py', 'engine.py', 'datasets.py',
++    'continual_datasets/continual_datasets.py', 'modules/frequency_state.py',
++    'tools/frequency_setup.py', 'tools/frequency_run.py', 'tools/prepare_cub200.py',
++    'tools/build_frequency_delivery.py', 'tools/verify_frequency_delivery.py',
++    'tests/test_frequency_state.py', 'README_FREQUENCY_STATE.md',
++    'references/align_only_seed3407/provenance.json',
++    'references/align_only_seed3407/official_split_manifest.json',
++    'references/align_only_seed3407/source_manifest.json']
++
++
++def cell(kind, source, **metadata):
++    value = dict(cell_type=kind, metadata=metadata,
++                 source=textwrap.dedent(source).strip().splitlines(keepends=True))
++    if kind == 'code':
++        value.update(execution_count=None, outputs=[])
++    return value
++
++
++def build():
++    patch = ''
++    hashes = {}
++    for name in SOURCES:
++        new = (ROOT / name).read_bytes().replace(b'\r\n', b'\n')
++        hashes[name] = hashlib.sha256(new).hexdigest()
++        base = subprocess.run(['git', 'show', f'{BASE}:{name}'], cwd=ROOT, capture_output=True)
++        old = base.stdout.replace(b'\r\n', b'\n') if base.returncode == 0 else b''
++        if old == new:
++            continue
++        patch += f'diff --git a/{name} b/{name}\n'
++        if base.returncode:
++            patch += 'new file mode 100644\n'
++        lines = difflib.unified_diff(old.decode().splitlines(keepends=True), new.decode().splitlines(keepends=True),
++                                    fromfile=f'a/{name}' if base.returncode == 0 else '/dev/null', tofile=f'b/{name}')
++        for line in lines:
++            patch += line if line.endswith('\n') else line + '\n\\ No newline at end of file\n'
++    patch = patch.encode()
++    sha = hashlib.sha256(patch).hexdigest()
++    manifest = dict(base_commit=BASE, branch='feat/task-frequency-state', patch_sha256=sha,
++                    source_files_sha256=hashes, serialization='LF', source_mode='embedded patch; no remote feature branch required',
++                    reused_dgca_patch_sha256='ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e')
++    payload = base64.b64encode(patch).decode()
++    cells = [cell('markdown', '''
++        # SEEP frequency-state recall — CUB200, seed 3407
++
++        Enable **GPU + Internet**. Add Input `trungkiennguyn/lgsp-dataset` and
++        **your original SEEP task1..task10 checkpoints from the same run**.
++        Attach Inputs before background Save Version. The supplied metrics ZIP
++        contains no checkpoints. Reeval runs first; missing inputs never trigger training.
++        No CLS Steering / N1 / CCSR / Gaussian alignment / transport is used.
++        Local validation is synthetic; this notebook has no precomputed CUB result.
++    '''), cell('code', '''
++        import sys, os, json, hashlib, base64, subprocess, shutil, time, traceback
++        from pathlib import Path
++        RUN_MODE = 'reeval'  # Alternative: 'train_collect' starts a NEW full 10 x 30 run.
++        CHECKPOINT_ROOT = '/kaggle/input'
++        CHECKPOINT_MAP = None  # JSON path or dict {"1": "/kaggle/input/my-run/task1_checkpoint.pth", ... "10": ...}
++        TRUSTED_CHECKPOINTS = False  # True ONLY for your own trusted Namespace/pickle checkpoints.
++        DATA_ROOT = None  # Set official CUB root here if discovery finds duplicates.
++        REPO = Path('/kaggle/working/SEEP_Frequency_State')
++        READY = Path('/kaggle/working/cub200_ready_frequency_state')
++        OUTPUT = Path('/kaggle/working/seep_frequency_state_seed3407')
++        NPZ_PATH = Path('/kaggle/working/pretrained/ViT-B_16.npz')
++        assert RUN_MODE in ('reeval', 'train_collect')
++        assert not OUTPUT.exists(), 'Use a fresh OUTPUT directory to preserve previous results.'
++        OUTPUT.mkdir(parents=True)
++        (OUTPUT/'run_status.json').write_text(json.dumps({'status':'configured','full_protocol_complete':False}))
++        NOTEBOOK_STARTED = time.perf_counter()
++        def record_cell_failure(result):
++            error = result.error_before_exec or result.error_in_exec
++            if error is None: return
++            (OUTPUT/'run_status.json').write_text(json.dumps({'status':'failed','error':str(error),'full_protocol_complete':False}))
++            (OUTPUT/'timing.json').write_text(json.dumps({'notebook_elapsed_seconds':time.perf_counter()-NOTEBOOK_STARTED}))
++            with (OUTPUT/'run.log').open('a',encoding='utf8') as stream:
++                traceback.print_exception(type(error),error,error.__traceback__,file=stream)
++            summary_path = OUTPUT/'summary.json'
++            if summary_path.exists():
++                summary=json.loads(summary_path.read_text()); summary['full_protocol_complete']=False
++                summary['process_success']=False; summary_path.write_text(json.dumps(summary,indent=2))
++            # Works even when clone/dependency setup fails before project imports.
++            import zipfile
++            archive=OUTPUT.parent/'SEEP_FREQUENCY_STATE_CUB200_metrics.zip'
++            with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as bundle:
++                for path in sorted(OUTPUT.rglob('*')):
++                    if path.is_file() and path.suffix.lower() in {'.json','.csv','.txt','.log','.patch','.md','.ipynb','.xml'}:
++                        bundle.write(path,str(path.relative_to(OUTPUT)))
++            print('Failed/partial archive:',archive)
++        if 'get_ipython' in globals():
++            get_ipython().events.register('post_run_cell',record_cell_failure)
++        files = sorted(p for p in Path(CHECKPOINT_ROOT).rglob('*')
++                       if p.is_file() and p.suffix.lower() in {'.pth','.pt','.ckpt'})
++        print('Checkpoint candidate files (not yet loaded/validated):', len(files))
++        for p in files[:40]: print(f'{p.stat().st_size/2**20:.1f} MiB  {p}')
++    '''), cell('code', f'''
++        BASE_COMMIT = {BASE!r}
++        PATCH_SHA256 = {sha!r}
++        PATCH_B64 = {payload!r}
++        DELIVERY = {manifest!r}
++        assert not REPO.exists(), 'Use a new REPO directory; existing work is preserved.'
++        subprocess.check_call(['git','clone','https://github.com/thanhphu25/SEEP.git',str(REPO)])
++        subprocess.check_call(['git','config','core.autocrlf','false'], cwd=REPO)
++        subprocess.check_call(['git','checkout','--detach',BASE_COMMIT], cwd=REPO)
++        patch = base64.b64decode(PATCH_B64)
++        assert hashlib.sha256(patch).hexdigest() == PATCH_SHA256
++        patch_path = REPO/'implementation.patch'
++        patch_path.write_bytes(patch)
++        subprocess.check_call(['git','apply','--check',str(patch_path)], cwd=REPO)
++        subprocess.check_call(['git','apply',str(patch_path)], cwd=REPO)
++        for name, expected in DELIVERY['source_files_sha256'].items():
++            assert hashlib.sha256((REPO/name).read_bytes()).hexdigest() == expected, name
++        (OUTPUT/'source_manifest.json').write_text(json.dumps(DELIVERY,indent=2))
++        shutil.copyfile(patch_path, OUTPUT/'implementation.patch')
++        shutil.copyfile(REPO/'README_FREQUENCY_STATE.md',OUTPUT/'README.md')
++        sys.path.insert(0,str(REPO))
++        from tools.frequency_setup import export
++        def checked_command(command, phase):
++            tick = time.perf_counter()
++            with (OUTPUT/'run.log').open('a',encoding='utf8') as log:
++                log.write('\\nPHASE '+phase+'\\n'); log.flush()
++                process = subprocess.Popen(command,cwd=REPO,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
++                    text=True,encoding='utf8',errors='replace',env={{**os.environ,'PYTHONUNBUFFERED':'1','PYTHONIOENCODING':'utf8'}})
++                try:
++                    for line in process.stdout: print(line,end=''); log.write(line); log.flush()
++                    result = process.wait()
++                except BaseException:
++                    process.terminate()
++                    try: process.wait(timeout=10)
++                    except subprocess.TimeoutExpired: process.kill(); process.wait()
++                    raise
++            (OUTPUT/(phase+'_result.json')).write_text(json.dumps({{'returncode':result,'seconds':time.perf_counter()-tick}}))
++            if result != 0:
++                (OUTPUT/'run_status.json').write_text(json.dumps({{'status':'failed','phase':phase,'returncode':result,'full_protocol_complete':False}}))
++                summary_path = OUTPUT/'summary.json'
++                if summary_path.exists():
++                    summary=json.loads(summary_path.read_text()); summary['full_protocol_complete']=False
++                    summary_path.write_text(json.dumps(summary,indent=2))
++                print('Partial/failure archive:',export(OUTPUT))
++                raise subprocess.CalledProcessError(result,command)
++        print('Pinned source and patch verified:',PATCH_SHA256)
++        checked_command([sys.executable,'tools/build_frequency_delivery.py'],'notebook_export')
++        shutil.copyfile(REPO/'SEEP_Frequency_State_CUB200_Kaggle.ipynb',OUTPUT/'SEEP_Frequency_State_CUB200_Kaggle.ipynb')
++    ''', tags=['embedded-source'], jupyter={'source_hidden': True}, collapsed=True), cell('code', '''
++        # Keep installed torch/torchvision; timm shim is idempotent on Python 3.13.
++        checked_command([sys.executable,'-c',
++            "from tools.frequency_setup import dependencies; dependencies("+repr(str(OUTPUT))+")"], 'dependencies')
++        import torch, torchvision
++        print('Actual stack:',sys.version,torch.__version__,torchvision.__version__)
++        assert torch.cuda.is_available(), 'Enable GPU in Kaggle settings.'
++        print('GPU:',torch.cuda.get_device_name())
++    '''), cell('code', '''
++        # Tests use synthetic CPU tensors; no scientific accuracy claim.
++        checked_command([sys.executable,'-m','pytest','-q','tests/test_frequency_state.py',
++                         '-p','no:cacheprovider','--junitxml='+str(OUTPUT/'tests.xml')], 'tests')
++    '''), cell('code', '''
++        CONFIG = dict(run_mode=RUN_MODE,checkpoint_root=CHECKPOINT_ROOT,checkpoint_map=CHECKPOINT_MAP,
++            trusted_checkpoints=TRUSTED_CHECKPOINTS,data_path=str(READY),output=str(OUTPUT),
++            npz_path=str(NPZ_PATH),device='cuda:0',num_workers=4)
++        CONFIG_PATH = OUTPUT/'notebook_config.json'
++        CONFIG_PATH.write_text(json.dumps(CONFIG,indent=2))
++        # Inventory and extraction happen BEFORE expensive evaluation. No images or optimizer step.
++        checked_command([sys.executable,'tools/frequency_run.py','--config',str(CONFIG_PATH),'--inventory-only'], 'inventory')
++        report=json.loads((OUTPUT/'checkpoint_inventory.json').read_text())
++        for row in report.get('boundaries',[]):
++            print(row['boundary'],row['status'],'epoch=',row.get('epoch'),'path=',row['path'])
++        print('Missing:',report.get('missing_boundaries',[]))
++    '''), cell('code', '''
++        # Official metadata + split hashes, never a random train/test split.
++        checked_command([sys.executable,'-c',
++            "from tools.frequency_setup import prepare_data; import json; print(json.dumps(prepare_data("
++            +repr(None if DATA_ROOT is None else str(DATA_ROOT))+","+repr(str(READY))+"),indent=2))"], 'data')
++        shutil.copyfile(READY/'official_split_manifest.json',OUTPUT/'official_split_manifest.json')
++    '''), cell('code', '''
++        # Full preflight verifies saved args, frozen routing NPZ, strict dynamic load, transforms and GPU.
++        # The runner performs that preflight before evaluating any boundary. No optimizer in reeval.
++        # Progress includes boundary/task/images/elapsed/ETA; all stdout is retained in run.log.
++        checked_command([sys.executable,'tools/frequency_run.py','--config',str(CONFIG_PATH)], 'evaluation')
++    '''), cell('code', '''
++        # Recompute from exported CSV matrices and require successful process exit.
++        import numpy as np
++        from modules.frequency_state import CHANNELS
++        from tools.frequency_run import write_metrics
++        status=json.loads((OUTPUT/'run_status.json').read_text())
++        result=json.loads((OUTPUT/'evaluation_result.json').read_text())
++        matrices={k:np.loadtxt(OUTPUT/f'task_accuracy_matrix_{k}.csv',delimiter=',') for k in CHANNELS}
++        checks=json.loads((OUTPUT/'mutation_checks.json').read_text())
++        summary=write_metrics(OUTPUT,matrices,process_success=result['returncode']==0,
++            checks_pass=len(checks)==10 and all(c['passed'] for c in checks))
++        assert status['status']=='complete' and summary['full_protocol_complete']
++        archive=export(OUTPUT)
++        print(json.dumps({'primary_delta_pp':summary['snapshot_minus_live_percentage_points']['raw_exact'],
++                          'screening_signal':summary['screening_signal'],'full_protocol_complete':True},indent=2))
++        from IPython.display import display, FileLink
++        print('Metrics ZIP (no model checkpoints):',archive)
++        display(FileLink(str(archive)))
++    ''')]
++    notebook = dict(cells=cells, metadata=dict(kernelspec=dict(display_name='Python 3', language='python', name='python3'),
++        language_info=dict(name='python'), kaggle=dict(isGpuEnabled=True, isInternetEnabled=True)), nbformat=4, nbformat_minor=5)
++    import ast
++    for i, c in enumerate(cells):
++        c['id'] = f'frequency-{i:02d}'
++        if c['cell_type'] == 'code':
++            ast.parse(''.join(c['source']))
++    (ROOT / 'frequency_state_implementation.patch').write_bytes(patch)
++    (ROOT / 'frequency_state_delivery.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf8')
++    (ROOT / 'SEEP_Frequency_State_CUB200_Kaggle.ipynb').write_text(json.dumps(notebook, ensure_ascii=False, indent=1) + '\n', encoding='utf8')
++    with zipfile.ZipFile(ROOT / 'SEEP_FREQUENCY_STATE_CUB200_delivery.zip', 'w', zipfile.ZIP_DEFLATED) as z:
++        for name in ['SEEP_Frequency_State_CUB200_Kaggle.ipynb', 'frequency_state_implementation.patch',
++                     'frequency_state_delivery.json', 'README_FREQUENCY_STATE.md']:
++            z.write(ROOT / name, name)
++    print(json.dumps(dict(patch_sha256=sha, files=len(SOURCES), cells=len(cells))))
++
++
++if __name__ == '__main__':
++    build()
+diff --git a/tools/verify_frequency_delivery.py b/tools/verify_frequency_delivery.py
+new file mode 100644
+--- /dev/null
++++ b/tools/verify_frequency_delivery.py
+@@ -0,0 +1,91 @@
++"""Reconstruct the embedded patch on a clean pinned checkout and run CPU tests."""
++import ast
++import base64
++import hashlib
++import json
++import os
++import subprocess
++import sys
++import uuid
++import xml.etree.ElementTree as ET
++import zipfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def checked(command, cwd):
++    result = subprocess.run(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++    if result.returncode:
++        raise RuntimeError(result.stdout.decode('utf8', errors='replace'))
++    return result.stdout
++
++
++def verify():
++    manifest = json.loads((ROOT / 'frequency_state_delivery.json').read_text(encoding='utf8'))
++    nb = json.loads((ROOT / 'SEEP_Frequency_State_CUB200_Kaggle.ipynb').read_text(encoding='utf8'))
++    literals = {}
++    for c in nb['cells']:
++        assert c.get('outputs', []) == [] and c.get('execution_count') is None
++        if c['cell_type'] != 'code':
++            continue
++        parsed = ast.parse(''.join(c['source']))
++        for node in parsed.body:
++            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
++                if node.targets[0].id in ('PATCH_B64', 'PATCH_SHA256', 'BASE_COMMIT', 'DELIVERY'):
++                    literals[node.targets[0].id] = ast.literal_eval(node.value)
++    patch = base64.b64decode(literals['PATCH_B64'])
++    assert hashlib.sha256(patch).hexdigest() == manifest['patch_sha256'] == literals['PATCH_SHA256']
++    assert patch == (ROOT / 'frequency_state_implementation.patch').read_bytes()
++    parent = ROOT / '.delivery-check'
++    parent.mkdir(exist_ok=True)
++    checkout = parent / str(uuid.uuid4())
++    # Local clone only: no network or modification of the user's current branch.
++    checked(['git', 'clone', '--shared', '--no-checkout', str(ROOT), str(checkout)], ROOT)
++    checked(['git', 'config', 'core.autocrlf', 'false'], checkout)
++    checked(['git', 'checkout', '--detach', manifest['base_commit']], checkout)
++    path = checkout / 'implementation.patch'
++    path.write_bytes(patch)
++    checked(['git', 'apply', '--check', str(path)], checkout)
++    checked(['git', 'apply', str(path)], checkout)
++    for name, expected in manifest['source_files_sha256'].items():
++        assert hashlib.sha256((checkout / name).read_bytes()).hexdigest() == expected, name
++    checked([sys.executable, 'tools/build_frequency_delivery.py'], checkout)
++    for name in ('frequency_state_implementation.patch', 'SEEP_Frequency_State_CUB200_Kaggle.ipynb'):
++        assert (checkout / name).read_bytes() == (ROOT / name).read_bytes(), 'Non-reproducible rebuild: ' + name
++    output = ROOT / 'validation/frequency_state'
++    output.mkdir(parents=True, exist_ok=True)
++    command = [sys.executable, '-m', 'pytest', '-q', 'tests/test_frequency_state.py', '-p', 'no:cacheprovider',
++               '--tb=short', '--junitxml=' + str(output / 'reconstructed_tests.xml')]
++    result = subprocess.run(command, cwd=checkout, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                            env={**os.environ, 'PYTHONIOENCODING': 'utf8'})
++    (output / 'reconstructed_tests.log').write_bytes(result.stdout)
++    suite = ET.parse(output / 'reconstructed_tests.xml').getroot()
++    totals = {key: sum(int(s.attrib.get(key, 0)) for s in suite.iter('testsuite'))
++              for key in ('tests', 'failures', 'errors', 'skipped')}
++    import torch, torchvision, timm
++    report = dict(validation='clean pinned checkout + embedded patch + synthetic CPU tests',
++        base_commit=manifest['base_commit'], patch_sha256=manifest['patch_sha256'],
++        all_source_hashes_match=True, notebook_code_cells_parse=True, notebook_has_no_outputs=True,
++        standalone_notebook_rebuild_byte_exact=True,
++        returncode=result.returncode, test_counts=totals, checkpoint_files_in_delivery=False,
++        full_cub_run=False, actual_environment=dict(python=sys.version, torch=torch.__version__,
++            torchvision=torchvision.__version__, timm=timm.__version__, cuda_available=torch.cuda.is_available()),
++        not_run=['Real CUB 55 paired task-boundary evaluations', 'Full 10x30 GPU train_collect',
++                 'User checkpoint provenance/strict loading (only synthetic checkpoints tested)'])
++    (output / 'delivery_validation.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf8')
++    with zipfile.ZipFile(ROOT / 'SEEP_FREQUENCY_STATE_CUB200_delivery.zip', 'a', zipfile.ZIP_DEFLATED) as archive:
++        existing = set(archive.namelist())
++        for name in ('delivery_validation.json', 'reconstructed_tests.xml', 'reconstructed_tests.log'):
++            target = 'validation/' + name
++            if target not in existing:
++                archive.write(output / name, target)
++        assert not any(n.lower().endswith(('.pth', '.pt', '.ckpt')) for n in archive.namelist())
++    print(json.dumps(report, indent=2))
++    if result.returncode:
++        print(result.stdout.decode('utf8', errors='replace'))
++        raise SystemExit(result.returncode)
++
++
++if __name__ == '__main__':
++    verify()
+diff --git a/tests/test_frequency_state.py b/tests/test_frequency_state.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_frequency_state.py
+@@ -0,0 +1,492 @@
++import copy
++import json
++import subprocess
++import sys
++import types
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++from torch import nn
++from torch.utils.data import DataLoader, TensorDataset
++
++from modules.frequency_state import (CHANNELS, PROTOCOL, FrequencyBank, checkpoint_mapping,
++    dynamic_strict_load, inventory, load_checkpoint, matrix_metrics, paired_evaluate,
++    state_from, tensor_hash)
++from tools.frequency_run import Collector, write_metrics
++from tools.frequency_setup import export, shim_timm_text
++
++ROOT = Path(__file__).resolve().parents[1]
++BASE = '80081081ab42769d102f83d447705da0639e2fb1'
++
++
++@pytest.fixture
++def tmp_path():
++    # Python 3.9 on a restricted Windows token cannot reopen mode=0700 dirs
++    # created by pytest's default tmp_path. Inherit the workspace ACL instead.
++    import uuid
++    path = ROOT / '.test-runs' / str(uuid.uuid4())
++    path.mkdir(parents=True)
++    return path
++
++
++@pytest.fixture(autouse=True)
++def single_thread():
++    old = torch.get_num_threads()
++    torch.set_num_threads(1)
++    yield
++    torch.set_num_threads(old)
++
++
++def options():
++    args = SimpleNamespace(lgsp='YES', lgsp_type='LGSP', num_tasks=3, input_size=16,
++        num_r=100, prompt_hid_dim=3, Dropout_Prompt=.1, temperature=1.)
++    return dict(img_size=16, patch_size=8, embed_dim=24, depth=2, num_heads=3,
++        num_classes=7, fc_norm=True, prompt_length=4, prompt_pool=True,
++        pool_size=3, top_k=1, use_e_prompt=True, e_prompt_layer_idx=[0, 1],
++        use_prefix_tune_for_e_prompt=True, n_tasks=3, D1=8, D2=12, use_linear=True,
++        relation_type='attention', KI_iter=1, self_attn_idx=[0, 1], warm_up=0, args=args)
++
++
++def make_model():
++    from vision_transformer import VisionTransformer
++    return VisionTransformer(**options())
++
++
++def prepare_model(model, tasks=3):
++    model.ensure_prompt_generator(tasks - 1)
++    model.register_buffer('stored_unified_prompts', torch.randn(3, 3, 16, 16)) if not hasattr(model, 'stored_unified_prompts') else None
++    if 'stored_unified_prompts' not in model._buffers:
++        delattr(model, 'stored_unified_prompts')
++        model.register_buffer('stored_unified_prompts', torch.randn(3, 3, 16, 16))
++    with torch.no_grad():
++        model.rainbow_prompt.stored_rainbow_prompts.normal_()
++    return model.eval()
++
++
++def legacy_constructor():
++    source = subprocess.check_output(['git', 'show', f'{BASE}:vision_transformer.py'], cwd=ROOT).decode()
++    legacy = types.ModuleType('legacy_frequency_vit')
++    legacy.__file__ = str(ROOT / 'vision_transformer.py')
++    exec(compile(source.replace('@register_model\n', ''), '<pinned base ViT>', 'exec'), legacy.__dict__)
++    return legacy.VisionTransformer
++
++
++def test_off_matches_actual_base_logits_head_features_and_training_rng():
++    from vision_transformer import VisionTransformer
++    old = legacy_constructor()
++    def trace(constructor):
++        torch.manual_seed(77)
++        model = constructor(**options())
++        init_rng = torch.get_rng_state().clone()
++        for name, param in model.named_parameters():
++            if name.startswith(('blocks.', 'patch_embed.', 'cls_token', 'norm.', 'pos_embed')):
++                param.requires_grad_(False)
++        optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=.001)
++        losses = []
++        for _ in range(2):
++            model.train()
++            x = torch.randn(3, 3, 16, 16)
++            out = model(x, task_id=0, learned_id=0, cls_features=torch.ones(3, 24), train=True, epoch_info=1)
++            loss = nn.functional.cross_entropy(out['logits'], torch.tensor([0, 1, 2])) - .1 * out['sim_loss']
++            optimizer.zero_grad()
++            loss.backward()
++            optimizer.step()
++            losses.append(loss.item())
++        model.eval()
++        captured = []
++        handle = model.head.register_forward_pre_hook(lambda m, inputs: captured.append(inputs[0].detach().clone()))
++        out = model(x, learned_id=0, cls_features=torch.ones(3, 24))
++        handle.remove()
++        return losses, tensor_hash(model.state_dict()), torch.get_rng_state(), out['logits'], captured[0], init_rng
++    a, b = trace(old), trace(VisionTransformer)
++    assert a[:2] == b[:2]
++    for i in (2, 3, 4, 5):
++        assert torch.equal(a[i], b[i])
++
++
++@pytest.mark.parametrize('route', [0, 1, 2])
++def test_equal_bank_any_original_router_route_logits_features_and_hook(route):
++    model = prepare_model(make_model())
++    bank = FrequencyBank()
++    for t in range(3):
++        bank.add(t, model, dict(boundary=t + 1))
++    cls = model.rainbow_prompt.base_key[route].detach().reshape(1, -1).repeat(2, 1)
++    x = torch.randn(2, 3, 16, 16)
++    with torch.no_grad():
++        live = model(x, cls_features=cls, learned_id=2)
++        assert model.matched_task_id == route
++        hooks = []
++        handle = model.head.register_forward_pre_hook(lambda m, inputs: hooks.append(inputs[0].clone()))
++        snap = model(x, cls_features=cls, learned_id=2, frequency_bank=bank)
++        handle.remove()
++    for key in ('logits', 'classifier_features'):
++        assert torch.equal(live[key], snap[key])
++    assert torch.equal(hooks[0], snap['classifier_features'])
++    assert not torch.equal(snap['pre_logits'], snap['classifier_features'])  # fc_norm=True
++
++
++def test_only_selected_slot_changes_frequency_mixing_path_and_keeps_caches():
++    model = prepare_model(make_model())
++    bank = FrequencyBank()
++    for t in range(3):
++        bank.add(t, model, {})
++    selected = 1
++    cls = model.rainbow_prompt.base_key[selected].detach()[None].repeat(2, 1)
++    x = torch.randn(2, 3, 16, 16)
++    before = tensor_hash(model.state_dict())
++    with torch.no_grad():
++        live = model(x, cls_features=cls, learned_id=2)
++        bank._slots[0]['alpha'].add_(100)
++        off = model(x, cls_features=cls, learned_id=2, frequency_bank=bank)
++        assert torch.equal(live['logits'], off['logits'])
++        bank._slots[selected]['weights'].neg_()
++        bank._slots[selected]['frequency_residual_scale'].fill_(.8)
++        bank._slots[selected]['alpha'].fill_(.8)
++        bank._slots[selected]['beta'].fill_(.2)
++        captured = []
++        handle = model.patch_embed.register_forward_pre_hook(lambda m, inputs: captured.append(inputs[0].clone()))
++        changed = model(x, cls_features=cls, learned_id=2, frequency_bank=bank)
++        handle.remove()
++        state = bank.select(selected, 2, x.device)
++        expected = state['alpha'] * (x + model.stored_unified_prompts[selected]) + state['beta'] * model.get_Frequency_mask(x, state)
++        assert torch.equal(captured[0], expected)
++        assert not torch.allclose(live['logits'], changed['logits'])
++    assert before == tensor_hash(model.state_dict())
++
++
++def test_bank_clones_validates_and_rejects_missing_future_duplicate():
++    model = make_model()
++    bank = FrequencyBank()
++    rng = torch.get_rng_state().clone()
++    bank.add(0, model, dict(checkpoint='boundary1'))
++    assert torch.equal(rng, torch.get_rng_state())
++    selected = bank.select(0, 0, 'cpu')
++    selected['weights'].zero_()
++    assert not torch.equal(selected['weights'], bank.select(0, 0, 'cpu')['weights'])
++    assert all(not v.requires_grad and v.device.type == 'cpu' for v in bank.select(0, 0, 'cpu').values())
++    assert sum(v.numel() for v in selected.values()) == 103
++    for slot, horizon in [(1, 0), (1, 1), (-1, 1), (0, -1)]:
++        with pytest.raises(ValueError):
++            bank.select(slot, horizon, 'cpu')
++    with pytest.raises(ValueError):
++        bank.add(0, model, {})
++    bad = state_from(model)
++    bad['alpha'] = bad['alpha'].double()
++    with pytest.raises(ValueError):
++        bank.add(1, bad, {})
++
++
++class Original(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.register_buffer('fixed', torch.tensor(1.))
++        self.calls = 0
++
++    def forward(self, x):
++        self.calls += 1
++        return {'pre_logits': x.mean((2, 3)).repeat(1, 8)}
++
++
++def test_paired_eval_hashes_routes_one_original_call_same_batch_and_restored_rng():
++    model = prepare_model(make_model())
++    original = Original()
++    model.train()
++    original.train()
++    bank = FrequencyBank()
++    for i in range(3):
++        bank.add(i, model, {})
++    loaders = [dict(val=DataLoader(TensorDataset(torch.randn(35, 3, 16, 16), torch.arange(35) % 7), batch_size=32)) for _ in range(3)]
++    matrices = {k: np.full((10, 10), np.nan) for k in CHANNELS}
++    model.matched_task_id, model.rainbow_prompt.task_id = 7, 6
++    rng, before = torch.get_rng_state().clone(), tensor_hash(model.state_dict())
++    routes, diag, check = paired_evaluate(model, original, loaders, 'cpu', 2, [[0, 1], [2, 3], [4, 5, 6]], bank, matrices, lambda _: None)
++    assert check['passed'] and before == tensor_hash(model.state_dict())
++    assert original.calls == 6
++    assert torch.equal(rng, torch.get_rng_state())
++    assert model.training and original.training
++    assert model.matched_task_id == 7 and model.rainbow_prompt.task_id == 6
++    assert sum(r['count'] for r in routes) == 105
++    assert all(d['max_abs_logit_delta'] == 0 and d['max_abs_classifier_feature_delta'] == 0 for d in diag)
++    np.testing.assert_equal(matrices['live_raw_exact'], matrices['snapshot_raw_exact'])
++
++
++def test_dynamic_strict_checkpoint_load_shapes_generators_and_ddp(tmp_path):
++    model = prepare_model(make_model(), 2)
++    state = copy.deepcopy(model.state_dict())
++    loaded = make_model()
++    rng = torch.get_rng_state().clone()
++    dynamic_strict_load(loaded, state, 2)
++    assert torch.equal(rng, torch.get_rng_state())
++    assert tensor_hash(loaded.state_dict()) == tensor_hash(state)
++    assert len(loaded.prompt_generators) == 2
++    with pytest.raises(ValueError, match='generators'):
++        dynamic_strict_load(make_model(), state, 1)
++    broken = dict(state)
++    del broken['head.bias']
++    with pytest.raises(RuntimeError):
++        dynamic_strict_load(make_model(), broken, 2)
++    path = tmp_path / 'ddp.pth'
++    torch.save(dict(model={'module.' + k: v for k, v in state.items()}, args=options()['args'], epoch=29), path)
++    _, restored, _, stripped = load_checkpoint(path, trusted=True)
++    assert stripped and tensor_hash(restored) == tensor_hash(state)
++    mixed = dict(state)
++    mixed['module.head.bias'] = mixed.pop('head.bias')
++    torch.save(dict(model=mixed, args={}, epoch=29), path)
++    with pytest.raises(ValueError, match='Mixed DDP'):
++        load_checkpoint(path, trusted=True)
++
++
++def synthetic_checkpoints(directory, n=10, dgca=False):
++    directory.mkdir(exist_ok=True)
++    args = dict(PROTOCOL, temperature=1., freeze=['blocks'], lr=.00375)
++    for b in range(1, n + 1):
++        state = dict(weights=torch.arange(100, dtype=torch.float32) + b, alpha=torch.tensor(.5),
++            beta=torch.tensor(.5), frequency_residual_scale=torch.tensor(.1), radii=torch.arange(100, dtype=torch.float32),
++            **{'blocks.0.weight': torch.ones(2)})
++        for t in range(b):
++            state[f'prompt_generators.{t}.0.weight'] = torch.ones(1)
++        payload = dict(model=state, args=args, epoch=29, run_id='synthetic-only')
++        if dgca:
++            payload.pop('args'); payload.pop('epoch')
++            payload.update(experiment_config=dict(args, dgca='align_only'),
++                           dgca=dict(config=dict(mode='align_only'), completed_boundary=b - 1))
++        torch.save(payload, directory / f'task{b}_checkpoint.pth')
++
++
++@pytest.mark.parametrize('dgca', [False, True])
++def test_inventory_extracts_own_boundary_sha_provenance_and_epoch29(tmp_path, dgca):
++    inputs, output = tmp_path / 'input', tmp_path / 'output'
++    synthetic_checkpoints(inputs, dgca=dgca)
++    report, bank = inventory(inputs, output, trusted=True)
++    assert report['full_trajectory']
++    assert len(report['boundaries']) == 10
++    for task in range(10):
++        assert bank.select(task, 9, 'cpu')['weights'][0] == task + 1
++        assert bank.provenance[task]['boundary'] == task + 1
++    saved = json.loads((output / 'frequency_bank.json').read_text())
++    assert saved['tensor_bytes'] == 4120 and saved['tensor_values'] == 1030
++
++
++@pytest.mark.parametrize('mutation', ['seed', 'temperature', 'backbone', 'radii', 'cls', 'ccsr', 'n1', 'epoch', 'run_id', 'transport'])
++def test_inventory_rejects_mixed_runs_enhancements_frozen_changes(tmp_path, mutation):
++    inputs, output = tmp_path / 'input', tmp_path / 'output'
++    synthetic_checkpoints(inputs)
++    path = inputs / 'task2_checkpoint.pth'
++    payload, _, _, _ = load_checkpoint(path, trusted=True)
++    if mutation in ('seed', 'temperature'):
++        payload['args'][mutation] += 1
++    elif mutation == 'backbone':
++        payload['model']['blocks.0.weight'].add_(1)
++    elif mutation == 'radii':
++        payload['model']['radii'].add_(1)
++    elif mutation in ('cls', 'ccsr', 'n1'):
++        payload['model'][{'cls': 'cls_steering.banks.0', 'ccsr': 'ccsr.weight', 'n1': 'n1.weight'}[mutation]] = torch.ones(1)
++    elif mutation == 'epoch':
++        payload['epoch'] = 28
++    elif mutation == 'transport':
++        payload['args']['dgca'] = 'transport'
++    else:
++        payload['run_id'] = 'another-run'
++    torch.save(payload, path)
++    with pytest.raises(ValueError):
++        inventory(inputs, output, trusted=True)
++    assert json.loads((output / 'checkpoint_inventory.json').read_text())['status'] == 'failed'
++
++
++def test_mapping_ambiguity_missing_and_final_only_do_not_train(tmp_path):
++    synthetic_checkpoints(tmp_path, n=1)
++    with pytest.raises(ValueError, match='Missing checkpoint boundaries'):
++        inventory(tmp_path, tmp_path / 'reports', trusted=True)
++    report = json.loads((tmp_path / 'reports/checkpoint_inventory.json').read_text())
++    assert report['missing_boundaries'] == list(range(2, 11))
++    other = tmp_path / 'other'
++    synthetic_checkpoints(other, n=1)
++    with pytest.raises(ValueError, match='Duplicate boundaries'):
++        checkpoint_mapping(tmp_path)
++    assert checkpoint_mapping(tmp_path, {'1': str(other / 'task1_checkpoint.pth')})[1].parent == other
++
++
++def test_metrics_rows_columns_task_average_peaks_partial_and_completion(tmp_path):
++    toy = np.array([[90., 80., 85.], [np.nan, 70., 65.], [np.nan, np.nan, 60.]])
++    m = matrix_metrics(toy)
++    assert m['aia'] == pytest.approx((90 + 75 + 70) / 3)
++    assert m['final_accuracy'] == 70
++    assert m['final_forgetting'] == 5
++    assert m['old_task_final_mean'] == 75
++    assert m['old_task_peak_mean'] == 80
++    assert m['bwt'] == -5
++    assert m['diagonal_initial_mean'] == pytest.approx(220 / 3)
++    partial = toy.copy(); partial[:, -1] = np.nan
++    assert matrix_metrics(partial)['aia'] is None
++    with pytest.raises(ValueError):
++        matrix_metrics(toy.T)
++    rising = toy.copy(); rising[1, 2] = 95
++    assert matrix_metrics(rising)['final_forgetting'] == 2.5
++    matrices = {k: np.full((10, 10), np.nan) for k in CHANNELS}
++    for a in matrices.values():
++        for t in range(10): a[:t + 1, t] = np.arange(t + 1) + 70
++    assert not write_metrics(tmp_path, matrices)['full_protocol_complete']
++    assert write_metrics(tmp_path, matrices, True, True)['full_protocol_complete']
++    (tmp_path / 'checkpoint').mkdir()
++    torch.save(dict(secret='not exported'), tmp_path / 'checkpoint/task1_checkpoint.pth')
++    import zipfile
++    with zipfile.ZipFile(export(tmp_path)) as archive:
++        assert not any(n.endswith('.pth') for n in archive.namelist())
++
++
++def test_collector_deterministic_training_trace_no_optimizer_membership_duplicate_guard(tmp_path):
++    def trajectory(collect):
++        torch.manual_seed(123)
++        model = make_model()
++        optimizer = torch.optim.Adam(model.parameters(), lr=.001)
++        bank = FrequencyBank()
++        matrices = {k: np.full((10, 10), np.nan) for k in CHANNELS}
++        observer = Collector(tmp_path, matrices, bank)
++        losses = []
++        for task in range(2):
++            for epoch in range(2):
++                model.train()
++                x = torch.randn(3, 3, 16, 16)
++                out = model(x, task_id=task, learned_id=task, cls_features=torch.ones(3, 24), train=True, epoch_info=epoch)
++                loss = out['logits'].square().mean() - .01 * out['sim_loss']
++                optimizer.zero_grad(); loss.backward(); optimizer.step()
++                losses.append(float(loss))
++            if collect:
++                observer.capture(model, task)
++                with pytest.raises(ValueError): observer.capture(model, task)  # resume/retry never overwrites a slot
++        if collect:
++            optimizer_ids = {id(p) for group in optimizer.param_groups for p in group['params']}
++            for state in bank._slots.values():
++                for tensor in state.values(): assert not tensor.requires_grad and id(tensor) not in optimizer_ids
++        return losses, tensor_hash(model.state_dict()), torch.get_rng_state()
++    a, b = trajectory(False), trajectory(True)
++    assert a[:2] == b[:2] and torch.equal(a[2], b[2])
++
++
++def test_timm_shim_idempotent():
++    text = 'from dataclasses import dataclass, replace\nconv_cfg: MaxxVitConvCfg = MaxxVitConvCfg()\ntransformer_cfg: MaxxVitTransformerCfg = MaxxVitTransformerCfg()\n'
++    once = shim_timm_text(text)
++    assert once == shim_timm_text(once) and once.count(', field') == 1
++
++
++def test_actual_runner_reeval_orchestrates_ten_boundaries_without_optimizer(tmp_path, monkeypatch):
++    """Synthetic integration of actual runner, paired loop, strict load and exports.
++
++    Only protocol-size/data/NPZ/GPU setup is substituted. This is NOT CUB evidence.
++    """
++    import tools.frequency_run as runtime
++    import datasets
++    import timm.optim
++    import main  # Bind baseline engine imports before installing the optimizer tripwire.
++    args = runtime.default_args()
++    args.input_size, args.nb_classes, args.device = 16, 7, 'cpu'
++    opts = options()
++    opts.update(n_tasks=10, pool_size=10)
++    opts['args'] = args
++    from vision_transformer import VisionTransformer
++    source = VisionTransformer(**opts)
++    original = Original()
++    inputs = tmp_path / 'inputs'; inputs.mkdir()
++    bank = FrequencyBank()
++    entries = []
++    for b in range(1, 11):
++        source.ensure_prompt_generator(b - 1)
++        if 'stored_unified_prompts' not in source._buffers:
++            delattr(source, 'stored_unified_prompts')
++            source.register_buffer('stored_unified_prompts', torch.randn(10, 3, 16, 16))
++        with torch.no_grad(): source.alpha.add_(.001)
++        path = inputs / f'task{b}_checkpoint.pth'
++        torch.save(dict(model=source.state_dict(), args=args, epoch=29), path)
++        entries.append(dict(boundary=b, path=str(path), sha256=runtime.file_sha(path), args=vars(args).copy()))
++        bank.add(b - 1, source, dict(boundary=b))
++    def factory(a, path):
++        return VisionTransformer(**{**opts, 'args': a}), original
++    loader = DataLoader(TensorDataset(torch.randn(2, 3, 16, 16), torch.tensor([0, 1])), batch_size=32)
++    loaders = [dict(val=loader) for _ in range(10)]
++    monkeypatch.setattr(runtime, 'preflight', lambda config: (dict(boundaries=entries), bank))
++    monkeypatch.setattr(runtime, 'validate_config', lambda args: None)
++    monkeypatch.setattr(runtime, 'pretrained', lambda p, output: p)
++    monkeypatch.setattr(runtime, 'build_models', factory)
++    monkeypatch.setattr(runtime, 'verify_original', lambda *a: {'synthetic_test': True})
++    monkeypatch.setattr(runtime, 'require_gpu', lambda args: None)
++    monkeypatch.setattr(runtime, 'split_manifest', lambda *a: {'sha256': json.loads((ROOT/'references/align_only_seed3407/provenance.json').read_text())['split_sha256']})
++    monkeypatch.setattr(datasets, 'build_continual_dataloader', lambda args: (loaders, [[0, 1]] * 10))
++    def forbidden(*a, **kw): raise AssertionError('reeval constructed an optimizer')
++    monkeypatch.setattr(timm.optim, 'create_optimizer', forbidden)
++    monkeypatch.setattr(torch.optim.Optimizer, 'step', forbidden)
++    output = tmp_path / 'output'; output.mkdir()
++    (output / 'tests_result.json').write_text(json.dumps(dict(returncode=0)))
++    config = dict(output=str(output), run_mode='reeval', trusted_checkpoints=True,
++                  data_path='synthetic', npz_path='synthetic', device='cpu', num_workers=0)
++    runtime.run(config)
++    status = json.loads((output / 'run_status.json').read_text())
++    summary = json.loads((output / 'summary.json').read_text())
++    assert status['status'] == 'complete'
++    assert all(m['observed_cells'] == 55 for m in summary['metrics'].values())
++    assert original.calls == 55
++    assert json.loads((output/'run_config.json').read_text())['actual_args']['lr'] == args.lr
++    # Duplicate invocation preserves the previously committed result exactly.
++    before = (output / 'summary.json').read_bytes()
++    with pytest.raises(ValueError, match='fresh output'):
++        runtime.run(config)
++    assert (output / 'summary.json').read_bytes() == before
++
++
++def test_runner_missing_checkpoints_failure_archives_false_completion(tmp_path):
++    from tools.frequency_run import run
++    config = dict(output=str(tmp_path / 'output'), run_mode='reeval', checkpoint_root=str(tmp_path / 'missing'),
++        trusted_checkpoints=True, data_path='unused', npz_path='unused', device='cpu')
++    with pytest.raises(ValueError, match='Missing checkpoint boundaries'):
++        run(config)
++    output = tmp_path / 'output'
++    assert not json.loads((output / 'summary.json').read_text())['full_protocol_complete']
++    assert json.loads((output / 'run_status.json').read_text())['status'] == 'failed'
++    assert (tmp_path / 'SEEP_FREQUENCY_STATE_CUB200_metrics.zip').is_file()
++
++
++def test_actual_engine_observer_keeps_training_losses_states_optimizer_and_rng(tmp_path, monkeypatch):
++    import engine
++    from tools.frequency_run import default_args
++    from main import set_seed
++    from timm.optim import create_optimizer
++    from timm.scheduler import create_scheduler
++    monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
++    def trajectory(enabled):
++        set_seed(812)
++        args = default_args()
++        args.input_size, args.num_tasks, args.num_tasks_to_run = 16, 3, 2
++        args.nb_classes = 7
++        args.epochs, args.warm_up, args.device = 2, 0, 'cpu'
++        args.lr *= 32 / 256
++        output = tmp_path / ('on' if enabled else 'off'); output.mkdir()
++        args.output_dir = str(output)
++        from vision_transformer import VisionTransformer
++        model = VisionTransformer(**{**options(), 'args': args})
++        for name, param in model.named_parameters():
++            if name.startswith(tuple(args.freeze)): param.requires_grad_(False)
++        original = Original()
++        masks = [[0, 1, 2], [3, 4], [5, 6]]
++        loaders = []
++        for mask in masks:
++            data = TensorDataset(torch.randn(2, 3, 16, 16), torch.tensor(mask[:2]))
++            loaders.append(dict(train=DataLoader(data, batch_size=2), val=DataLoader(data, batch_size=32)))
++        optimizer = create_optimizer(args, model)
++        scheduler = create_scheduler(args, optimizer)[0]
++        bank = FrequencyBank()
++        collector = Collector(output, {k: np.full((10, 10), np.nan) for k in CHANNELS}, bank) if enabled else None
++        engine.train_and_evaluate(model, model, original, nn.CrossEntropyLoss(), loaders, optimizer,
++            scheduler, torch.device('cpu'), masks, args, boundary_observer=collector)
++        saved, state, _, _ = load_checkpoint(output / 'checkpoint/task2_checkpoint.pth', True)
++        records = [json.loads(line) for file in output.glob('*_stats.txt') for line in file.read_text().splitlines()]
++        losses = [r['train_Loss'] for r in records if 'train_Loss' in r]
++        assert len(losses) == 2
++        return losses, tensor_hash(state), saved['optimizer'], torch.get_rng_state()
++    off, on = trajectory(False), trajectory(True)
++    assert off[:2] == on[:2] and torch.equal(off[3], on[3])
++    for key in off[2]['state']:
++        for field, value in off[2]['state'][key].items():
++            other = on[2]['state'][key][field]
++            assert torch.equal(value, other) if torch.is_tensor(value) else value == other
+diff --git a/README_FREQUENCY_STATE.md b/README_FREQUENCY_STATE.md
+new file mode 100644
+--- /dev/null
++++ b/README_FREQUENCY_STATE.md
+@@ -0,0 +1,128 @@
++# SEEP task frequency-state recall — CUB200 / seed 3407
++
++This implementation tests one mechanism: recall the frequency state belonging to
++the task selected by the unchanged SEEP batch router. It does not introduce a new
++loss, classifier, representation module, Gaussian alignment, or transport.
++
++Import `SEEP_Frequency_State_CUB200_Kaggle.ipynb` into Kaggle. Enable GPU and
++Internet. Add Input `trungkiennguyn/lgsp-dataset` and your own trusted original
++SEEP checkpoint dataset. For background Save Version, attach both datasets with
++Add Input first; do not rely on an interactive kagglehub attachment persisting.
++The notebook can discover official CUB metadata or attach the image dataset with
++kagglehub. If the dataset lacks official metadata it stops and requests an
++official CUB-200-2011 Input. It never creates a random split.
++
++## Two explicit modes
++
++`RUN_MODE = 'reeval'` is the default. It performs no training, optimizer creation,
++or head fitting. Supply boundaries 1..10 from the same original SEEP run. The
++default discovery pattern is `task1_checkpoint.pth` ... `task10_checkpoint.pth`.
++For different filenames, multiple runs, or duplicate boundaries, set
++`CHECKPOINT_MAP` to a JSON path or dictionary of **one-based** boundaries to
++absolute Input paths, for example `{"1": "/kaggle/input/my-run/task1_checkpoint.pth"}`
++(include all 10 entries). The bank itself uses **zero-based** task indices.
++Checkpoint files are read in place on CPU one at a time; they are not copied to
++working and optimizer payloads are released before model evaluation.
++
++Namespace checkpoints require `TRUSTED_CHECKPOINTS = True` for your own trusted
++files. This explicitly enables pickle loading on current PyTorch. Unidentified
++files, CLS Steering, N1, CCSR and DGCA transport checkpoints are rejected.
++DGCA `align_only` checkpoints may supply `experiment_config` instead of `args`;
++only their raw SEEP model is used. A lone `dgca_latest.pth` is not a trajectory.
++If metadata cannot prove common run lineage/commit/environment, the inventory
++records that limitation even when tensor/config consistency checks pass.
++
++`RUN_MODE = 'train_collect'` explicitly starts a **new full 10 × 30 epoch run**.
++It uses the pinned original training loop and optimizer grouping, with fresh LR
++.03 scaled once to .00375 (local .0005; frequency .03 before scheduler). The
++observer clones snapshots after the last scheduler update, before original
++evaluation. Its paired evaluation preserves RNG, modes and routing attributes.
++Training resume is deliberately unsupported: an existing checkpoint directory
++or bank is rejected. Use a new output for another run. This prevents replaying
++metrics or replacing old snapshots; a final checkpoint is never treated as a
++training resume. Interrupted source checkpoints remain available for explicit
++reeval when a complete sequence is supplied. Historical 2–3 hour training time
++is only a reference; measured progress/ETA is printed during execution.
++
++## What the inputs permit
++
++| Available artifacts | Valid result |
++|---|---|
++| Boundaries 1..10, consistent same-run provenance | Four matrices, AIA, final accuracy, forgetting |
++| Final checkpoint + complete historical bank | Final metrics only; this notebook requires the trajectory for full reeval |
++| Final checkpoint without historical bank | Old frequency states cannot be recovered |
++
++Missing checkpoints stop reeval with their boundary numbers. There is no
++automatic switch to training, substitution of the latest state, or use of
++historical baseline numbers as measurements.
++
++## Protocol and implementation
++
++Pinned base: `80081081ab42769d102f83d447705da0639e2fb1` from
++<https://github.com/thanhphu25/SEEP>. The notebook embeds a SHA256-verified patch
++and clones this base; it does not require a pushed feature branch. Only the CUB
++ImageFolder adapter, lazy video imports and `tools/prepare_cub200.py` were reused
++from the supplied align-only ZIP. Original DGCA patch SHA256:
++`ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e`.
++See `references/align_only_seed3407/provenance.json`. No DGCA runtime is included.
++Original source attribution and copyright comments are retained.
++
++Official CUB train/test counts are 5,994/5,794; 200 classes, 10 tasks × 20,
++unshuffled class order, seed 3407, batch 32, sequential per-task validation with
++drop_last=False. Original Resize/CenterCrop/ToTensor evaluation preprocessing is
++unchanged. The router selects a task for a whole batch, so validation task loaders
++must not be combined. Main accuracy uses all classifier logits (`raw_exact`);
++`raw_seen` separately masks seen classes, never the true task. Test labels are
++used only to count correct predictions.
++
++Each slot contains float32 `weights[100]`, `frequency_residual_scale`, `alpha`,
++and `beta`: 103 values/task, 4,120 bytes total tensor values for 10 tasks, plus
++metadata. Radii, temperature, fixed configuration and declared frozen backbone
++tensors must agree across checkpoints. Dynamic CNN generators and runtime
++spatial buffers are reconstructed before strict loading. No `strict=False` is
++used. Snapshot arguments are functional; no live Parameters are overwritten.
++The original FFT/ifft/abs, rings, temperature and mixing expression are retained.
++Actual head features are exposed after `fc_norm`, with no new learned projection.
++
++Keep Kaggle torch/torchvision. Install timm 0.6.11 without dependencies and apply
++the idempotent MaxxVit dataclass compatibility shim if needed. Actual versions
++and GPU are recorded. The original ViT-B/16 NPZ is verified against
++`ac7478131e1b77e5c2f0225849730bd19ee89cfffe600c2dfd2272b34a50a43d`.
++
++## Outputs and interpretation
++
++Default output: `/kaggle/working/seep_frequency_state_seed3407`.
++`SEEP_FREQUENCY_STATE_CUB200_metrics.zip` contains four full-precision CSV
++matrices, summaries, per-task initial/peak/final values, comparison deltas,
++checkpoint/bank provenance, route counts, paired output diagnostics, mutation
++checks, source/split/pretrained manifests, environment, configuration, timing,
++logs, tests, patch, README and an output-free notebook. Model checkpoints are
++excluded. In train_collect they remain separately in the working checkpoint
++directory; retain them separately if needed.
++
++Convention: `A[i,t]` is task i accuracy after boundary t; future cells are NaN.
++AIA is the average of boundary task means. Final forgetting averages
++`max(A[i,i:10]) - A[i,9]` over old tasks i<9, using each branch's own matrix.
++Old-task final/peak means, diagonal mean and BWT are reported. Deltas are
++percentage points. Completion requires 10 boundaries, 55 cells per matrix,
++passed tests/preflight/mutation checks and successful process exit. Failed or
++interrupted runs remain failed/partial; CPU synthetic tests are not CUB results.
++
++The primary comparison is snapshot minus live from the same checkpoint
++trajectory. Screening requires AIA >= +.3 pp, final > 0 and old-task final > 0;
++the additional forgetting goal requires F < 0 and interpretation alongside peaks.
++One seed is not statistical significance. Do not tune slots on test accuracy.
++This is prompt-state management/recall; novelty and zero forgetting are not
++established. DualPrompt is related prior work, not evidence for this SEEP change:
++<https://research.google/pubs/dualprompt-complementary-prompting-for-rehearsal-free-continual-learning/>.
++
++Local checks:
++
++```powershell
++python -m pytest -q tests/test_frequency_state.py -p no:cacheprovider
++python tools/build_frequency_delivery.py
++python tools/verify_frequency_delivery.py
++```
++
++The delivery validation JSON records the actual local stack and test outcomes.
++No local full CUB/GPU experiment is claimed without its own completed artifacts.
+diff --git a/references/align_only_seed3407/provenance.json b/references/align_only_seed3407/provenance.json
+new file mode 100644
+--- /dev/null
++++ b/references/align_only_seed3407/provenance.json
+@@ -0,0 +1,12 @@
++{
++  "split_sha256": "7f1cbc969854e73a21fba66461422d852d77405aa71dfbf9712d5f74de825e40",
++  "source_zip": "SEEP_ALIGN_ONLY_CUB200_metrics.zip",
++  "source_zip_sha256": "570a0e4705202f369ab72d265c4d3022d00a73682d5829b1c710d7bdf2f11f80",
++  "dgca_patch_sha256": "ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e",
++  "reused_files": [
++    "continual_datasets/continual_datasets.py",
++    "datasets.py",
++    "tools/prepare_cub200.py"
++  ],
++  "dgca_runtime_included": false
++}
+\ No newline at end of file
+diff --git a/references/align_only_seed3407/official_split_manifest.json b/references/align_only_seed3407/official_split_manifest.json
+new file mode 100644
+--- /dev/null
++++ b/references/align_only_seed3407/official_split_manifest.json
+@@ -0,0 +1,12 @@
++{
++  "source": "/kaggle/input/datasets/trungkiennguyn/lgsp-dataset/LGSP/CUB_200_2011/CUB_200_2011",
++  "image_count": 11788,
++  "train": 5994,
++  "test": 5794,
++  "classes": 200,
++  "official_metadata_sha256": {
++    "images.txt": "e1cfc5ed1f4bd1b838040784b6f75c44f7a25d9b31707a3adab49ec694618c1f",
++    "image_class_labels.txt": "e9df8c96d897994a245746fe2c98914b9b31f5342bddc6e8b06bdfbf45e49b02",
++    "train_test_split.txt": "8bbbfcc09b4d3c9c6e3e40c9874bd863eb6658f4f456e472df1b33d3403d2600"
++  }
++}
+diff --git a/references/align_only_seed3407/source_manifest.json b/references/align_only_seed3407/source_manifest.json
+new file mode 100644
+--- /dev/null
++++ b/references/align_only_seed3407/source_manifest.json
+@@ -0,0 +1,91 @@
++{
++  "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
++  "implementation_commit": "80081081ab42769d102f83d447705da0639e2fb1",
++  "branch": "experiment/align-only-seed3407",
++  "working_tree_status": "M configs/cub200_10task.py\n M continual_datasets/continual_datasets.py\n M datasets.py\n M engine.py\n M main.py\n M vision_transformer.py\n?? README_DGCA.md\n?? align_only_preflight_change.json\n?? dgca_delivery.json\n?? dgca_implementation.patch\n?? modules/\n?? tests/\n?? timm_compatibility.json\n?? tools/\n?? transport_reference.json",
++  "diff_sha256": "ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e",
++  "source_files_sha256": {
++    "prompt.py": "052d288a335d3d4255fad6a679890ddef3c4f1de837ece2064c1e8f67857b465",
++    "datasets.py": "d9a75e0685cf6f2b95a6af57f4be854c12e647e9e71bafed30a95e06eb43f835",
++    "adaptive_prompting.py": "a875ed0de97054400d019e3808caefe675bb4fcec8a7dae0af87ef8978c162c6",
++    "engine.py": "ad18248616085ee608b4af15828a70ea0b35c5574e03ad44869830f32af3fd5a",
++    "models.py": "9a6f7e1ea649de8d0fcce772f1197eaa065fbf0540d0a3a4b17d7d0592f50e37",
++    "attention.py": "bed8a5f1dbc13717e7c0ae29ae9bab16d15592428d91e9547a4a25cf22f67e5c",
++    "vision_transformer.py": "5a9d2ee07b1ea1a0977da86ad64bedac92603269c629c42d14117608e49783fc",
++    "utils.py": "7f4c402e074590068c5440c501f6f8b571d1e9ed564a1559dbd8737264ef4e6d",
++    "main.py": "a4366f3833db28008044c021c7e55bcf85bda6b4230d61685bae736c371566de",
++    "modules/dgca.py": "0580058d687cba11745ce69f72560126aa90a7585bcd043b20d53c9f79100acd",
++    "modules/dgca_data.py": "3ef5c119c4e2193d4d96eaddd116927ec926bed8dfdba10031ac3739dc64095e",
++    "modules/dgca_runtime.py": "45df5dd4a1d9866139836280e321a1bb042d2dab9b0ae276034ee57d7ef2010b",
++    "tools/smoke_dgca.py": "f80b0779fa5478c1c3b2c33eeb1cb7fd7a7763f0201429c14d5c9c347767658e",
++    "tools/summarize_dgca.py": "a82ca711a1ccfa7a001d0d05a6fdf5f0bef7d97381ad1fdd844f30573f81e4f2",
++    "tools/preflight_dgca.py": "6a834795c5f396f496b9b20146e2f57c2d262aa1c47760b611b77e520e5aad81",
++    "tools/build_dgca_delivery.py": "1406f1dc6b672fc6682cc4fbcdc7a15f6d63659544555eeab6e78dd7216cb394",
++    "tools/prepare_cub200.py": "5ec826cd800bc9a2038c9dd432c5b589d2f5696c8470a47acbdac5d53bad1ee2",
++    "configs/cifar100_20task.py": "9f3200cf298de1db3399db5ef6a1278912f4df7e73c385417b3672dbbbfa9890",
++    "configs/imr_10task.py": "95fa7342737d7040e5b54796e68df1f6c2a22eb12fe00e787c77c3692ee48529",
++    "configs/ucf101_20task.py": "f35770661bdf8a91c10f242811a6ce466c654f06fcfd3d2f22f148344088c53c",
++    "configs/activitynet_20task.py": "68a43782523df611e5e3a23a562a4a02047b01a815e6a18a5b6257b73c024a0c",
++    "configs/ucf101_10task.py": "aeaec11bd841c28549fb5dd9c8d213b9dde0cc53c39e3652a6f7c644bf676aac",
++    "configs/activitynet_10task.py": "49f7f3c6de63807e9841250d7875027c1ba88463d15a52d4299e53482ebecab9",
++    "configs/cifar100_10task.py": "009d750d13799b17ca7f91cb1418d67a4c2a15b2ca47c0b8fdd624cbfdce62b2",
++    "configs/imr_20task.py": "e76e4c996572737c7bcdc5906dd124135b9e6129f20f9fa61f3f2547201cefb5",
++    "configs/cub200_10task.py": "5cb3958c5a92a6e761910b783e376eac579341873840f47cda4eeee9e8de7d2a",
++    "configs/cub200_20task.py": "e5720039debb826bd491ff0cf6367be06befb0d49b8f6a3920d3d928578c4e59"
++  },
++  "pretrained_source": {
++    "url": "https://storage.googleapis.com/vit_models/imagenet21k/ViT-B_16.npz",
++    "num_classes": 1000,
++    "input_size": [
++      3,
++      224,
++      224
++    ],
++    "pool_size": null,
++    "crop_pct": 0.9,
++    "interpolation": "bicubic",
++    "fixed_input_size": true,
++    "mean": [
++      0.5,
++      0.5,
++      0.5
++    ],
++    "std": [
++      0.5,
++      0.5,
++      0.5
++    ],
++    "first_conv": "patch_embed.proj",
++    "classifier": "head",
++    "architecture": "vit_base_patch16_224"
++  },
++  "cached_weights_sha256": {
++    "ViT-B_16.npz": "ac7478131e1b77e5c2f0225849730bd19ee89cfffe600c2dfd2272b34a50a43d"
++  },
++  "original_representation_sha256": "f54beb937f1147de7b8cb6f3069b39c9ddc32fa8404f6c339dcf0ba0047cda1a",
++  "delivery_manifest": {
++    "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
++    "implementation_source_commit": "05c482b536802d614ce68ab36f20ac79db3caa92",
++    "branch": "feat/dgca-classifier-alignment",
++    "patch_sha256": "ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e",
++    "delivery_mode": "embedded_patch_on_pinned_base",
++    "source_files": [
++      "configs/cub200_10task.py",
++      "continual_datasets/continual_datasets.py",
++      "datasets.py",
++      "engine.py",
++      "main.py",
++      "vision_transformer.py",
++      "modules/dgca.py",
++      "modules/dgca_data.py",
++      "modules/dgca_runtime.py",
++      "tools/summarize_dgca.py",
++      "tools/prepare_cub200.py",
++      "tools/preflight_dgca.py",
++      "tools/smoke_dgca.py",
++      "tools/build_dgca_delivery.py",
++      "tests/test_dgca.py",
++      "README_DGCA.md"
++    ]
++  }
++}

@@ -247,7 +247,7 @@ def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, d
 
 def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Module, original_model: torch.nn.Module, 
                     criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer, lr_scheduler, device: torch.device, 
-                    class_mask=None, args = None,):
+                    class_mask=None, args = None, boundary_observer=None,):
 
     # create matrix to save end-of-task accuracies 
     acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
@@ -327,8 +327,12 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
                 lr_scheduler.step(epoch)
         
         
+        if boundary_observer is not None:
+            boundary_observer.capture(model_without_ddp, task_id)
         test_stats = evaluate_till_now(model=model, original_model=original_model, data_loader=data_loader, device=device, 
                                     task_id=task_id, class_mask=class_mask, acc_matrix=acc_matrix, args=args)
+        if boundary_observer is not None:
+            boundary_observer.evaluate(model_without_ddp, original_model, data_loader, device, task_id, class_mask)
         if args.output_dir and utils.is_main_process():
             Path(os.path.join(args.output_dir, 'checkpoint')).mkdir(parents=True, exist_ok=True)
 

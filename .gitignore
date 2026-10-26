@@ -1,2 +1,6 @@
-__pycache__
-logs/*
+__pycache__/
+.pytest_cache/
+.test-runs/
+.delivery-check/
+logs/
+artifacts/
