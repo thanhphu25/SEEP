@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = '80081081ab42769d102f83d447705da0639e2fb1'
-SOURCES = ['vision_transformer.py', 'engine.py', 'datasets.py',
+SOURCES = ['.gitattributes', '.gitignore', 'vision_transformer.py', 'engine.py', 'datasets.py',
     'continual_datasets/continual_datasets.py', 'modules/frequency_state.py',
     'tools/frequency_setup.py', 'tools/frequency_run.py', 'tools/prepare_cub200.py',
     'tools/build_frequency_delivery.py', 'tools/verify_frequency_delivery.py',

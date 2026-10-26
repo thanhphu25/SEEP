@@ -1,3 +1,33 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,9 @@
++.gitattributes text eol=lf
++.gitignore text eol=lf
++*.py text eol=lf
++*.md text eol=lf
++*.json text eol=lf
++*.ipynb text eol=lf
++*.patch text eol=lf
++*.log text eol=lf
++*.xml text eol=lf
+diff --git a/.gitignore b/.gitignore
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,9 @@
+-__pycache__
+-logs/*
+\ No newline at end of file
++__pycache__/
++.pytest_cache/
++.test-runs/
++.delivery-check/
++logs/
++artifacts/
++SEEP_FREQUENCY_STATE_CUB200_delivery.zip
++validation/frequency_state/tests.log
++validation/frequency_state/tests.xml
 diff --git a/vision_transformer.py b/vision_transformer.py
 --- a/vision_transformer.py
 +++ b/vision_transformer.py
@@ -1151,7 +1181,7 @@ new file mode 100644
 +
 +ROOT = Path(__file__).resolve().parents[1]
 +BASE = '80081081ab42769d102f83d447705da0639e2fb1'
-+SOURCES = ['vision_transformer.py', 'engine.py', 'datasets.py',
++SOURCES = ['.gitattributes', '.gitignore', 'vision_transformer.py', 'engine.py', 'datasets.py',
 +    'continual_datasets/continual_datasets.py', 'modules/frequency_state.py',
 +    'tools/frequency_setup.py', 'tools/frequency_run.py', 'tools/prepare_cub200.py',
 +    'tools/build_frequency_delivery.py', 'tools/verify_frequency_delivery.py',

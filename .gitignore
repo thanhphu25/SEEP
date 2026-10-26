@@ -4,3 +4,6 @@ __pycache__/
 .delivery-check/
 logs/
 artifacts/
+SEEP_FREQUENCY_STATE_CUB200_delivery.zip
+validation/frequency_state/tests.log
+validation/frequency_state/tests.xml
