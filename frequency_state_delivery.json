@@ -1,7 +1,7 @@
 {
   "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
   "branch": "feat/task-frequency-state",
-  "patch_sha256": "760426e5db0933e09fb5325760fee266a5491776a8893221d61ab87529b32538",
+  "patch_sha256": "f525afc40a282641f8094a90f85ac8ff1886dc9548d1573c116b1a2541bf0ed9",
   "source_files_sha256": {
     ".gitattributes": "47047bf270bfe020c8b14cabcc3b10783b00410aadc17c45438d1e27fe89ec1d",
     ".gitignore": "45d987b708eb5f87d889628e5cafa03ef284312b63ca5aa99d06b1708b26422c",
@@ -13,8 +13,8 @@
     "tools/frequency_setup.py": "60df75fcdc4716772bd0c2f623dedbe858b8ab599ebcc338c9c199f553df33d4",
     "tools/frequency_run.py": "12425cb9b76eecd01ada91735bb086b83fbb1123c283b8399c41ce2ff7da4fd7",
     "tools/prepare_cub200.py": "5ec826cd800bc9a2038c9dd432c5b589d2f5696c8470a47acbdac5d53bad1ee2",
-    "tools/build_frequency_delivery.py": "8cf3852934b494cbaba9705b2cfabe39e79a64b74bd2e48a4ed38cb617ab0c84",
-    "tools/verify_frequency_delivery.py": "adc493026cf0632a2bc0731fd135fcd691fef494a7a3fb463874d7cbac29dd7d",
+    "tools/build_frequency_delivery.py": "8a1e80ce48fd72e095ebb2f28bb34eee83536c11ff0654a5090d7cb21cf93714",
+    "tools/verify_frequency_delivery.py": "b4faa45f4b5ea20e024caaad8b7e84a2e4e3d3ed33ce2a6a8f3a4f405a6c94d0",
     "tests/test_frequency_state.py": "5e1409d79573feca54ba65680936257d373e1536b513d1779f4e2578d933bb2e",
     "README_FREQUENCY_STATE.md": "3737443b5e959f55723651b39b684786a0ae356f1716f79107740663ff78b978",
     "references/align_only_seed3407/provenance.json": "ceff45e6a12f3d778ec827858bb5027181ec110edc3672ba65a1f5442247a654",

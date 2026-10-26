@@ -212,8 +212,8 @@ def build():
         if c['cell_type'] == 'code':
             ast.parse(''.join(c['source']))
     (ROOT / 'frequency_state_implementation.patch').write_bytes(patch)
-    (ROOT / 'frequency_state_delivery.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf8')
-    (ROOT / 'SEEP_Frequency_State_CUB200_Kaggle.ipynb').write_text(json.dumps(notebook, ensure_ascii=False, indent=1) + '\n', encoding='utf8')
+    (ROOT / 'frequency_state_delivery.json').write_bytes((json.dumps(manifest, indent=2) + '\n').encode('utf8'))
+    (ROOT / 'SEEP_Frequency_State_CUB200_Kaggle.ipynb').write_bytes((json.dumps(notebook, ensure_ascii=False, indent=1) + '\n').encode('utf8'))
     with zipfile.ZipFile(ROOT / 'SEEP_FREQUENCY_STATE_CUB200_delivery.zip', 'w', zipfile.ZIP_DEFLATED) as z:
         for name in ['SEEP_Frequency_State_CUB200_Kaggle.ipynb', 'frequency_state_implementation.patch',
                      'frequency_state_delivery.json', 'README_FREQUENCY_STATE.md']:

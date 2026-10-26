@@ -1,7 +1,7 @@
 {
   "validation": "clean pinned checkout + embedded patch + synthetic CPU tests",
   "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
-  "patch_sha256": "760426e5db0933e09fb5325760fee266a5491776a8893221d61ab87529b32538",
+  "patch_sha256": "f525afc40a282641f8094a90f85ac8ff1886dc9548d1573c116b1a2541bf0ed9",
   "all_source_hashes_match": true,
   "notebook_code_cells_parse": true,
   "notebook_has_no_outputs": true,

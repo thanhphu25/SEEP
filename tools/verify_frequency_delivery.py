@@ -59,7 +59,7 @@ def verify():
                '--tb=short', '--junitxml=' + str(output / 'reconstructed_tests.xml')]
     result = subprocess.run(command, cwd=checkout, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             env={**os.environ, 'PYTHONIOENCODING': 'utf8'})
-    (output / 'reconstructed_tests.log').write_bytes(result.stdout)
+    (output / 'reconstructed_tests.log').write_bytes(result.stdout.replace(b'\r\n', b'\n'))
     suite = ET.parse(output / 'reconstructed_tests.xml').getroot()
     totals = {key: sum(int(s.attrib.get(key, 0)) for s in suite.iter('testsuite'))
               for key in ('tests', 'failures', 'errors', 'skipped')}
@@ -73,7 +73,7 @@ def verify():
             torchvision=torchvision.__version__, timm=timm.__version__, cuda_available=torch.cuda.is_available()),
         not_run=['Real CUB 55 paired task-boundary evaluations', 'Full 10x30 GPU train_collect',
                  'User checkpoint provenance/strict loading (only synthetic checkpoints tested)'])
-    (output / 'delivery_validation.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf8')
+    (output / 'delivery_validation.json').write_bytes((json.dumps(report, indent=2) + '\n').encode('utf8'))
     with zipfile.ZipFile(ROOT / 'SEEP_FREQUENCY_STATE_CUB200_delivery.zip', 'a', zipfile.ZIP_DEFLATED) as archive:
         existing = set(archive.namelist())
         for name in ('delivery_validation.json', 'reconstructed_tests.xml', 'reconstructed_tests.log'):
