@@ -104,6 +104,13 @@ must not be combined. Main accuracy uses all classifier logits (`raw_exact`);
 `raw_seen` separately masks seen classes, never the true task. Test labels are
 used only to count correct predictions.
 
+Preflight checks the three official metadata SHA256 values, then compares every
+loader sample's path, label, split, task and order against those records. This
+also preserves the sequential batches used by the router. `split_verification.json`
+records the result. The old align-only manifest digest is diagnostic only because
+its serialization schema was not archived; a different digest cannot by itself
+invalidate the official split. Changes to actual samples, labels or order still stop the run.
+
 Each slot contains float32 `weights[100]`, `frequency_residual_scale`, `alpha`,
 and `beta`: 103 values/task, 4,120 bytes total tensor values for 10 tasks, plus
 metadata. Radii, temperature, fixed configuration and declared frozen backbone

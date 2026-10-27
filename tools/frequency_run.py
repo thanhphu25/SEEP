@@ -81,9 +81,15 @@ def build_models(args, npz):
 
 
 def split_manifest(loaders, masks, args):
-    from torch.utils.data import Subset
+    from torch.utils.data import SequentialSampler, Subset
+    if len(loaders) != 10:
+        raise ValueError('Expected all 10 CUB task loaders')
     tasks = []
     for task in loaders:
+        if any(task[scope].batch_size != 32 or task[scope].drop_last for scope in ('train', 'val')):
+            raise ValueError('CUB loaders require batch_size=32 and drop_last=False')
+        if not isinstance(task['val'].sampler, SequentialSampler):
+            raise ValueError('CUB validation requires sequential per-task sample order')
         entry = {}
         for split in ('train', 'val'):
             base = task[split].dataset
@@ -104,6 +110,46 @@ def split_manifest(loaders, masks, args):
         raise ValueError('Official CUB counts differ')
     return dict(**value, sha256=digest, train_transform=str(loaders[0]['train'].dataset.dataset.transform),
                 val_transform=str(loaders[0]['val'].dataset.dataset.transform))
+
+
+def verify_task_split(split, metadata_root, official_reference, historical_sha256=None):
+    """Compare ordered loader records to trusted official metadata, not an undocumented old digest."""
+    from tools.prepare_cub200 import read_records
+    import hashlib
+    metadata_root = Path(metadata_root)
+    hashes = {name: file_sha(metadata_root / name)
+              for name in ('images.txt', 'image_class_labels.txt', 'train_test_split.txt')}
+    if hashes != official_reference['official_metadata_sha256']:
+        raise ValueError('Prepared CUB metadata SHA256 differs from the official reference')
+    images = read_records(metadata_root / 'images.txt')
+    labels = {i: int(value) - 1 for i, value in read_records(metadata_root / 'image_class_labels.txt').items()}
+    flags = {i: int(value) for i, value in read_records(metadata_root / 'train_test_split.txt').items()}
+    masks = [list(range(t * 20, (t + 1) * 20)) for t in range(10)]
+    expected = dict(class_mask=masks, tasks=[{} for _ in masks], batch_size=32,
+                    stats_sampler='sequential', stats_drop_last=False)
+    counts = {}
+    for scope, flag in (('train', 1), ('val', 0)):
+        # ImageFolder sorts class directories and filenames. Preserve this order because routing is batchwise.
+        ordered = sorted((path, labels[i]) for i, path in images.items() if flags[i] == flag)
+        counts[scope] = len(ordered)
+        for task, mask in enumerate(masks):
+            expected['tasks'][task][scope] = [dict(index=i, label=label, path=path)
+                for i, (path, label) in enumerate(ordered) if label in mask]
+    if counts != dict(train=5994, val=5794):
+        raise ValueError('Official CUB metadata must contain 5994 train and 5794 test images')
+    if any(split.get(key) != value for key, value in expected.items()):
+        raise ValueError('Prepared task split does not match official CUB metadata: '
+                         'check image membership, labels, indices and ordered task batches')
+    expected_sha = hashlib.sha256(json.dumps(expected, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    if split.get('sha256') != expected_sha:
+        raise ValueError('Prepared task split hash is inconsistent with its sample records')
+    return dict(passed=True, schema='seep_task_split_v1', sha256=expected_sha,
+        official_metadata_sha256=hashes, checked_images=sum(counts.values()),
+        train=counts['train'], test=counts['val'], num_tasks=10,
+        historical_manifest_sha256=historical_sha256,
+        historical_hash_matches=None if historical_sha256 is None else expected_sha == historical_sha256,
+        historical_hash_role='Diagnostic only: the historical manifest schema was not archived. '
+                             'Acceptance uses official metadata and exact ordered sample records.')
 
 
 def verify_original(model, original, args):
@@ -270,8 +316,11 @@ def run(config, check_only=False):
         split = split_manifest(loaders, masks, args)
         json_write(output / 'split_manifest.json', split)
         reference = json.loads((ROOT / 'references/align_only_seed3407/provenance.json').read_text())
-        if reference.get('split_sha256') and split['sha256'] != reference['split_sha256']:
-            raise ValueError('Prepared task split differs from verified run')
+        official_reference = json.loads((ROOT / 'references/align_only_seed3407/official_split_manifest.json').read_text())
+        verification = verify_task_split(split, Path(args.data_path) / 'CUB_200_2011',
+                                        official_reference, reference.get('split_sha256'))
+        json_write(output / 'split_verification.json', verification)
+        print('Official CUB task split verified: 5994 train / 5794 test, 10 tasks, ordered batches of 32.', flush=True)
         model, original = build_models(args, npz)
         json_write(output / 'run_config.json', dict(mode=config['run_mode'], saved_args=saved, actual_args=vars(args),
             path_overrides=overrides, optimizer_created=config['run_mode'] == 'train_collect', lr_rescaled=report is None,
@@ -296,7 +345,7 @@ def run(config, check_only=False):
         if tests.get('returncode') != 0:
             raise ValueError('Required implementation tests have not passed')
         require_gpu(args)
-        json_write(output / 'preflight_results.json', dict(passed=True, checks=['protocol', 'official_split', 'NPZ_SHA256',
+        json_write(output / 'preflight_results.json', dict(passed=True, checks=['protocol', 'official_split', 'ordered_task_split', 'NPZ_SHA256',
             'strict_dynamic_first_checkpoint' if report else 'fresh_run', 'frozen_original', 'tests', 'GPU'],
             elapsed_seconds=time.perf_counter() - start))
         if check_only:

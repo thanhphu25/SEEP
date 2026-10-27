@@ -408,6 +408,83 @@ def test_prepare_data_rejects_missing_or_ambiguous_official_metadata(tmp_path):
         prepare_data(tmp_path, tmp_path / 'ready')
 
 
+@pytest.fixture
+def cub_metadata_loaders(tmp_path, monkeypatch):
+    """Full-size synthetic metadata through the real task splitter; no image decoding."""
+    import datasets
+    from tools.frequency_run import default_args
+    root = tmp_path / 'CUB_200_2011'; root.mkdir()
+    rows = []
+    for label in range(1, 201):
+        n_train, n_test = (29, 28) if label <= 6 else (30, 29)
+        for sample in range(n_train + n_test):
+            path = f'{label:03d}.Bird_{label:03d}/bird_{label:03d}_{sample:05d}.jpg'
+            rows.append((len(rows) + 1, path, label, int(sample < n_train)))
+    for name, column in (('images.txt', 1), ('image_class_labels.txt', 2), ('train_test_split.txt', 3)):
+        (root / name).write_text(''.join(f'{row[0]} {row[column]}\n' for row in rows), encoding='utf8')
+    class MetadataOnly(torch.utils.data.Dataset):
+        def __init__(self, flag):
+            self.samples = sorted((str(root / ('train' if flag else 'test') / path), label - 1)
+                                  for _, path, label, scope in rows if scope == flag)
+            self.targets = [label for _, label in self.samples]
+            self.classes = [f'{label:03d}.Bird_{label:03d}' for label in range(1, 201)]
+            self.transform = None
+        def __len__(self):
+            return len(self.samples)
+        def __getitem__(self, index):
+            raise AssertionError('This metadata regression must not decode images')
+    train, val = MetadataOnly(1), MetadataOnly(0)
+    monkeypatch.setattr(datasets, 'get_dataset', lambda *args: (train, val))
+    args = default_args()
+    args.num_workers, args.pin_mem = 0, False
+    loaders, masks = datasets.build_continual_dataloader(args)
+    from modules.frequency_state import file_sha
+    reference = dict(official_metadata_sha256={name: file_sha(root / name)
+        for name in ('images.txt', 'image_class_labels.txt', 'train_test_split.txt')})
+    return root, reference, args, loaders, masks
+
+
+@pytest.mark.parametrize('mutation', ['unchanged', 'label', 'order', 'membership', 'duplicate', 'index', 'metadata'])
+def test_official_split_verification_ignores_old_serializer_but_rejects_real_changes(cub_metadata_loaders, mutation):
+    from tools.frequency_run import split_manifest, verify_task_split
+    root, reference, args, loaders, masks = cub_metadata_loaders
+    split = split_manifest(loaders, masks, args)
+    historical = json.loads((ROOT / 'references/align_only_seed3407/provenance.json').read_text())['split_sha256']
+    assert split['sha256'] != historical
+    train, val = split['tasks'][0]['train'], split['tasks'][0]['val']
+    if mutation == 'label':
+        train[0]['label'] = 19
+    elif mutation == 'order':
+        train[0], train[1] = train[1], train[0]
+    elif mutation == 'membership':
+        train[0], val[0] = val[0], train[0]
+    elif mutation == 'duplicate':
+        train[1] = train[0].copy()
+    elif mutation == 'index':
+        train[0]['index'] = 100
+    elif mutation == 'metadata':
+        with (root / 'train_test_split.txt').open('a') as stream:
+            stream.write('11789 1\n')
+    if mutation == 'unchanged':
+        result = verify_task_split(split, root, reference, historical)
+        assert result['passed'] and result['checked_images'] == 11788
+        assert result['train'] == 5994 and result['test'] == 5794
+        assert result['sha256'] == split['sha256'] and not result['historical_hash_matches']
+    else:
+        with pytest.raises(ValueError, match='official CUB metadata|metadata SHA256'):
+            verify_task_split(split, root, reference, historical)
+
+
+@pytest.mark.parametrize('options', [dict(batch_size=16), dict(batch_size=32, drop_last=True),
+                                   dict(batch_size=32, shuffle=True)])
+def test_split_preflight_rejects_changed_validation_batches(cub_metadata_loaders, options):
+    from tools.frequency_run import split_manifest
+    _, _, args, loaders, masks = cub_metadata_loaders
+    loaders[0]['val'] = DataLoader(loaders[0]['val'].dataset, **options)
+    with pytest.raises(ValueError, match='batch_size=32|sequential per-task'):
+        split_manifest(loaders, masks, args)
+
+
 def test_notebook_bootstrap_clones_latest_branch_and_preserves_old_run(tmp_path):
     """Execute the real generated bootstrap against a local two-branch repository."""
     import shutil
@@ -495,6 +572,7 @@ def test_actual_runner_reeval_orchestrates_ten_boundaries_without_optimizer(tmp_
     monkeypatch.setattr(runtime, 'verify_original', lambda *a: {'synthetic_test': True})
     monkeypatch.setattr(runtime, 'require_gpu', lambda args: None)
     monkeypatch.setattr(runtime, 'split_manifest', lambda *a: {'sha256': json.loads((ROOT/'references/align_only_seed3407/provenance.json').read_text())['split_sha256']})
+    monkeypatch.setattr(runtime, 'verify_task_split', lambda *a: {'passed': True, 'synthetic_test': True})
     monkeypatch.setattr(datasets, 'build_continual_dataloader', lambda args: (loaders, [[0, 1]] * 10))
     def forbidden(*a, **kw): raise AssertionError('reeval constructed an optimizer')
     monkeypatch.setattr(timm.optim, 'create_optimizer', forbidden)
@@ -556,6 +634,7 @@ def test_actual_runner_full_training_without_checkpoint_input(tmp_path, monkeypa
     monkeypatch.setattr(runtime, 'require_gpu', lambda args: None)
     monkeypatch.setattr(runtime, 'split_manifest', lambda *a: {'sha256': json.loads(
         (ROOT / 'references/align_only_seed3407/provenance.json').read_text())['split_sha256']})
+    monkeypatch.setattr(runtime, 'verify_task_split', lambda *a: {'passed': True, 'synthetic_test': True})
     monkeypatch.setattr(datasets, 'build_continual_dataloader', lambda args: (loaders, masks))
     monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
     def forbidden(*a, **kw): raise AssertionError('Fresh training touched a full model checkpoint')

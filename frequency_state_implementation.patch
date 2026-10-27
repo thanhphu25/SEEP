@@ -720,7 +720,7 @@ diff --git a/tools/frequency_run.py b/tools/frequency_run.py
 new file mode 100644
 --- /dev/null
 +++ b/tools/frequency_run.py
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,435 @@
 +"""Full SEEP training with online paired evaluation, or explicit checkpoint reeval."""
 +import argparse
 +import csv
@@ -804,9 +804,15 @@ new file mode 100644
 +
 +
 +def split_manifest(loaders, masks, args):
-+    from torch.utils.data import Subset
++    from torch.utils.data import SequentialSampler, Subset
++    if len(loaders) != 10:
++        raise ValueError('Expected all 10 CUB task loaders')
 +    tasks = []
 +    for task in loaders:
++        if any(task[scope].batch_size != 32 or task[scope].drop_last for scope in ('train', 'val')):
++            raise ValueError('CUB loaders require batch_size=32 and drop_last=False')
++        if not isinstance(task['val'].sampler, SequentialSampler):
++            raise ValueError('CUB validation requires sequential per-task sample order')
 +        entry = {}
 +        for split in ('train', 'val'):
 +            base = task[split].dataset
@@ -827,6 +833,46 @@ new file mode 100644
 +        raise ValueError('Official CUB counts differ')
 +    return dict(**value, sha256=digest, train_transform=str(loaders[0]['train'].dataset.dataset.transform),
 +                val_transform=str(loaders[0]['val'].dataset.dataset.transform))
++
++
++def verify_task_split(split, metadata_root, official_reference, historical_sha256=None):
++    """Compare ordered loader records to trusted official metadata, not an undocumented old digest."""
++    from tools.prepare_cub200 import read_records
++    import hashlib
++    metadata_root = Path(metadata_root)
++    hashes = {name: file_sha(metadata_root / name)
++              for name in ('images.txt', 'image_class_labels.txt', 'train_test_split.txt')}
++    if hashes != official_reference['official_metadata_sha256']:
++        raise ValueError('Prepared CUB metadata SHA256 differs from the official reference')
++    images = read_records(metadata_root / 'images.txt')
++    labels = {i: int(value) - 1 for i, value in read_records(metadata_root / 'image_class_labels.txt').items()}
++    flags = {i: int(value) for i, value in read_records(metadata_root / 'train_test_split.txt').items()}
++    masks = [list(range(t * 20, (t + 1) * 20)) for t in range(10)]
++    expected = dict(class_mask=masks, tasks=[{} for _ in masks], batch_size=32,
++                    stats_sampler='sequential', stats_drop_last=False)
++    counts = {}
++    for scope, flag in (('train', 1), ('val', 0)):
++        # ImageFolder sorts class directories and filenames. Preserve this order because routing is batchwise.
++        ordered = sorted((path, labels[i]) for i, path in images.items() if flags[i] == flag)
++        counts[scope] = len(ordered)
++        for task, mask in enumerate(masks):
++            expected['tasks'][task][scope] = [dict(index=i, label=label, path=path)
++                for i, (path, label) in enumerate(ordered) if label in mask]
++    if counts != dict(train=5994, val=5794):
++        raise ValueError('Official CUB metadata must contain 5994 train and 5794 test images')
++    if any(split.get(key) != value for key, value in expected.items()):
++        raise ValueError('Prepared task split does not match official CUB metadata: '
++                         'check image membership, labels, indices and ordered task batches')
++    expected_sha = hashlib.sha256(json.dumps(expected, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++    if split.get('sha256') != expected_sha:
++        raise ValueError('Prepared task split hash is inconsistent with its sample records')
++    return dict(passed=True, schema='seep_task_split_v1', sha256=expected_sha,
++        official_metadata_sha256=hashes, checked_images=sum(counts.values()),
++        train=counts['train'], test=counts['val'], num_tasks=10,
++        historical_manifest_sha256=historical_sha256,
++        historical_hash_matches=None if historical_sha256 is None else expected_sha == historical_sha256,
++        historical_hash_role='Diagnostic only: the historical manifest schema was not archived. '
++                             'Acceptance uses official metadata and exact ordered sample records.')
 +
 +
 +def verify_original(model, original, args):
@@ -993,8 +1039,11 @@ new file mode 100644
 +        split = split_manifest(loaders, masks, args)
 +        json_write(output / 'split_manifest.json', split)
 +        reference = json.loads((ROOT / 'references/align_only_seed3407/provenance.json').read_text())
-+        if reference.get('split_sha256') and split['sha256'] != reference['split_sha256']:
-+            raise ValueError('Prepared task split differs from verified run')
++        official_reference = json.loads((ROOT / 'references/align_only_seed3407/official_split_manifest.json').read_text())
++        verification = verify_task_split(split, Path(args.data_path) / 'CUB_200_2011',
++                                        official_reference, reference.get('split_sha256'))
++        json_write(output / 'split_verification.json', verification)
++        print('Official CUB task split verified: 5994 train / 5794 test, 10 tasks, ordered batches of 32.', flush=True)
 +        model, original = build_models(args, npz)
 +        json_write(output / 'run_config.json', dict(mode=config['run_mode'], saved_args=saved, actual_args=vars(args),
 +            path_overrides=overrides, optimizer_created=config['run_mode'] == 'train_collect', lr_rescaled=report is None,
@@ -1019,7 +1068,7 @@ new file mode 100644
 +        if tests.get('returncode') != 0:
 +            raise ValueError('Required implementation tests have not passed')
 +        require_gpu(args)
-+        json_write(output / 'preflight_results.json', dict(passed=True, checks=['protocol', 'official_split', 'NPZ_SHA256',
++        json_write(output / 'preflight_results.json', dict(passed=True, checks=['protocol', 'official_split', 'ordered_task_split', 'NPZ_SHA256',
 +            'strict_dynamic_first_checkpoint' if report else 'fresh_run', 'frozen_original', 'tests', 'GPU'],
 +            elapsed_seconds=time.perf_counter() - start))
 +        if check_only:
@@ -1549,7 +1598,7 @@ diff --git a/tests/test_frequency_state.py b/tests/test_frequency_state.py
 new file mode 100644
 --- /dev/null
 +++ b/tests/test_frequency_state.py
-@@ -0,0 +1,667 @@
+@@ -0,0 +1,746 @@
 +import copy
 +import json
 +import subprocess
@@ -1960,6 +2009,83 @@ new file mode 100644
 +        prepare_data(tmp_path, tmp_path / 'ready')
 +
 +
++@pytest.fixture
++def cub_metadata_loaders(tmp_path, monkeypatch):
++    """Full-size synthetic metadata through the real task splitter; no image decoding."""
++    import datasets
++    from tools.frequency_run import default_args
++    root = tmp_path / 'CUB_200_2011'; root.mkdir()
++    rows = []
++    for label in range(1, 201):
++        n_train, n_test = (29, 28) if label <= 6 else (30, 29)
++        for sample in range(n_train + n_test):
++            path = f'{label:03d}.Bird_{label:03d}/bird_{label:03d}_{sample:05d}.jpg'
++            rows.append((len(rows) + 1, path, label, int(sample < n_train)))
++    for name, column in (('images.txt', 1), ('image_class_labels.txt', 2), ('train_test_split.txt', 3)):
++        (root / name).write_text(''.join(f'{row[0]} {row[column]}\n' for row in rows), encoding='utf8')
++    class MetadataOnly(torch.utils.data.Dataset):
++        def __init__(self, flag):
++            self.samples = sorted((str(root / ('train' if flag else 'test') / path), label - 1)
++                                  for _, path, label, scope in rows if scope == flag)
++            self.targets = [label for _, label in self.samples]
++            self.classes = [f'{label:03d}.Bird_{label:03d}' for label in range(1, 201)]
++            self.transform = None
++        def __len__(self):
++            return len(self.samples)
++        def __getitem__(self, index):
++            raise AssertionError('This metadata regression must not decode images')
++    train, val = MetadataOnly(1), MetadataOnly(0)
++    monkeypatch.setattr(datasets, 'get_dataset', lambda *args: (train, val))
++    args = default_args()
++    args.num_workers, args.pin_mem = 0, False
++    loaders, masks = datasets.build_continual_dataloader(args)
++    from modules.frequency_state import file_sha
++    reference = dict(official_metadata_sha256={name: file_sha(root / name)
++        for name in ('images.txt', 'image_class_labels.txt', 'train_test_split.txt')})
++    return root, reference, args, loaders, masks
++
++
++@pytest.mark.parametrize('mutation', ['unchanged', 'label', 'order', 'membership', 'duplicate', 'index', 'metadata'])
++def test_official_split_verification_ignores_old_serializer_but_rejects_real_changes(cub_metadata_loaders, mutation):
++    from tools.frequency_run import split_manifest, verify_task_split
++    root, reference, args, loaders, masks = cub_metadata_loaders
++    split = split_manifest(loaders, masks, args)
++    historical = json.loads((ROOT / 'references/align_only_seed3407/provenance.json').read_text())['split_sha256']
++    assert split['sha256'] != historical
++    train, val = split['tasks'][0]['train'], split['tasks'][0]['val']
++    if mutation == 'label':
++        train[0]['label'] = 19
++    elif mutation == 'order':
++        train[0], train[1] = train[1], train[0]
++    elif mutation == 'membership':
++        train[0], val[0] = val[0], train[0]
++    elif mutation == 'duplicate':
++        train[1] = train[0].copy()
++    elif mutation == 'index':
++        train[0]['index'] = 100
++    elif mutation == 'metadata':
++        with (root / 'train_test_split.txt').open('a') as stream:
++            stream.write('11789 1\n')
++    if mutation == 'unchanged':
++        result = verify_task_split(split, root, reference, historical)
++        assert result['passed'] and result['checked_images'] == 11788
++        assert result['train'] == 5994 and result['test'] == 5794
++        assert result['sha256'] == split['sha256'] and not result['historical_hash_matches']
++    else:
++        with pytest.raises(ValueError, match='official CUB metadata|metadata SHA256'):
++            verify_task_split(split, root, reference, historical)
++
++
++@pytest.mark.parametrize('options', [dict(batch_size=16), dict(batch_size=32, drop_last=True),
++                                   dict(batch_size=32, shuffle=True)])
++def test_split_preflight_rejects_changed_validation_batches(cub_metadata_loaders, options):
++    from tools.frequency_run import split_manifest
++    _, _, args, loaders, masks = cub_metadata_loaders
++    loaders[0]['val'] = DataLoader(loaders[0]['val'].dataset, **options)
++    with pytest.raises(ValueError, match='batch_size=32|sequential per-task'):
++        split_manifest(loaders, masks, args)
++
++
 +def test_notebook_bootstrap_clones_latest_branch_and_preserves_old_run(tmp_path):
 +    """Execute the real generated bootstrap against a local two-branch repository."""
 +    import shutil
@@ -2047,6 +2173,7 @@ new file mode 100644
 +    monkeypatch.setattr(runtime, 'verify_original', lambda *a: {'synthetic_test': True})
 +    monkeypatch.setattr(runtime, 'require_gpu', lambda args: None)
 +    monkeypatch.setattr(runtime, 'split_manifest', lambda *a: {'sha256': json.loads((ROOT/'references/align_only_seed3407/provenance.json').read_text())['split_sha256']})
++    monkeypatch.setattr(runtime, 'verify_task_split', lambda *a: {'passed': True, 'synthetic_test': True})
 +    monkeypatch.setattr(datasets, 'build_continual_dataloader', lambda args: (loaders, [[0, 1]] * 10))
 +    def forbidden(*a, **kw): raise AssertionError('reeval constructed an optimizer')
 +    monkeypatch.setattr(timm.optim, 'create_optimizer', forbidden)
@@ -2108,6 +2235,7 @@ new file mode 100644
 +    monkeypatch.setattr(runtime, 'require_gpu', lambda args: None)
 +    monkeypatch.setattr(runtime, 'split_manifest', lambda *a: {'sha256': json.loads(
 +        (ROOT / 'references/align_only_seed3407/provenance.json').read_text())['split_sha256']})
++    monkeypatch.setattr(runtime, 'verify_task_split', lambda *a: {'passed': True, 'synthetic_test': True})
 +    monkeypatch.setattr(datasets, 'build_continual_dataloader', lambda args: (loaders, masks))
 +    monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
 +    def forbidden(*a, **kw): raise AssertionError('Fresh training touched a full model checkpoint')
@@ -2221,7 +2349,7 @@ diff --git a/README_FREQUENCY_STATE.md b/README_FREQUENCY_STATE.md
 new file mode 100644
 --- /dev/null
 +++ b/README_FREQUENCY_STATE.md
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,166 @@
 +# SEEP task frequency-state recall — CUB200 / seed 3407
 +
 +This implementation tests one mechanism: recall the frequency state belonging to
@@ -2327,6 +2455,13 @@ new file mode 100644
 +must not be combined. Main accuracy uses all classifier logits (`raw_exact`);
 +`raw_seen` separately masks seen classes, never the true task. Test labels are
 +used only to count correct predictions.
++
++Preflight checks the three official metadata SHA256 values, then compares every
++loader sample's path, label, split, task and order against those records. This
++also preserves the sequential batches used by the router. `split_verification.json`
++records the result. The old align-only manifest digest is diagnostic only because
++its serialization schema was not archived; a different digest cannot by itself
++invalidate the official split. Changes to actual samples, labels or order still stop the run.
 +
 +Each slot contains float32 `weights[100]`, `frequency_residual_scale`, `alpha`,
 +and `beta`: 103 values/task, 4,120 bytes total tensor values for 10 tasks, plus

@@ -1,14 +1,14 @@
-..................................                                       [100%]
+............................................                             [100%]
 ============================== warnings summary ===============================
 tests/test_frequency_state.py: 17 warnings
   D:\miniconda\envs\deepdoc\lib\site-packages\torch\jit\_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
     warnings.warn(
 
 tests/test_frequency_state.py::test_collector_deterministic_training_trace_no_optimizer_membership_duplicate_guard
-  D:\GITHUB_PROJECT\SEEP\.delivery-check\3a93b462-45dc-4f13-8ea3-3b5a2af20541\tests\test_frequency_state.py:356: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+  D:\GITHUB_PROJECT\SEEP\.delivery-check\c81298d5-7671-4ea3-add5-87b353f0084b\tests\test_frequency_state.py:356: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
   Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:837.)
     losses.append(float(loss))
 
 -- Docs: https://docs.pytest.org/en/stable/warnings.html
 - generated xml file: D:\GITHUB_PROJECT\SEEP\validation\frequency_state\reconstructed_tests.xml -
-34 passed, 18 warnings in 16.30s
+44 passed, 18 warnings in 18.83s
