@@ -1,4 +1,4 @@
-"""Paired raw SEEP frequency-state evaluation; reeval never builds an optimizer."""
+"""Full SEEP training with online paired evaluation, or explicit checkpoint reeval."""
 import argparse
 import csv
 import gc
@@ -161,7 +161,7 @@ def write_metrics(output, matrices, process_success=False, checks_pass=False):
     summary = dict(full_protocol_complete=complete, process_success=process_success, checks_pass=checks_pass,
         metrics=metrics, snapshot_minus_live_percentage_points=deltas, screening_signal=signal,
         forgetting_goal=None if signal is None else bool(signal and primary['final_forgetting'] < 0),
-        primary='paired raw_exact on the same checkpoint trajectory',
+        primary='paired raw_exact on the same model trajectory',
         interpretation='One seed; screening rule is not statistical significance. Inspect peaks with forgetting. '
         'No test-based state tuning or novelty/zero-forgetting claim.',
         historical_reference_only=dict(original=[87.5441, 86.4980, 2.9515],
@@ -202,10 +202,15 @@ def preflight(config):
         raise ValueError('run_mode must be reeval or train_collect')
     # Fresh run only; never resume silently from final checkpoint or overwrite old metrics/bank.
     if (output / 'checkpoint').exists() or (output / 'frequency_bank.json').exists():
-        raise ValueError('train_collect requires a fresh output. Interrupted collected checkpoints remain usable for explicit reeval; '
-                         'training resume is intentionally unsupported, so boundary metrics/snapshots cannot duplicate.')
-    json_write(output / 'checkpoint_inventory.json', dict(status='new_train_collect', missing_boundaries=list(range(1, 11)),
-        full_trajectory=False, note='New full 10x30 run. No final-checkpoint resume.'))
+        raise ValueError('train_collect requires a fresh output. Training resume is intentionally unsupported, '
+                         'so boundary metrics/snapshots cannot duplicate.')
+    save_checkpoints = config.get('save_checkpoints', True)
+    if type(save_checkpoints) is not bool:
+        raise ValueError('save_checkpoints must be a JSON boolean')
+    json_write(output / 'checkpoint_inventory.json', dict(status='not_required', missing_boundaries=[],
+        full_trajectory=False, note='Fresh full 10x30 training directly from CUB images; no source checkpoints.'))
+    json_write(output / 'training_manifest.json', dict(status='configured', num_tasks=10, epochs_per_task=30,
+        source_checkpoints_required=False, save_checkpoints=save_checkpoints, completed_boundaries=[]))
     return None, FrequencyBank()
 
 
@@ -270,6 +275,7 @@ def run(config, check_only=False):
         model, original = build_models(args, npz)
         json_write(output / 'run_config.json', dict(mode=config['run_mode'], saved_args=saved, actual_args=vars(args),
             path_overrides=overrides, optimizer_created=config['run_mode'] == 'train_collect', lr_rescaled=report is None,
+            save_checkpoints=config.get('save_checkpoints', True) if report is None else False,
             class_order=list(range(200)), cudnn_benchmark=torch.backends.cudnn.benchmark))
         import torchvision, timm
         json_write(output / 'environment.json', dict(python=sys.version, platform=platform.platform(), torch=torch.__version__,
@@ -331,13 +337,20 @@ def run(config, check_only=False):
             optimizer = create_optimizer(args, model)
             scheduler = create_scheduler(args, optimizer)[0] if args.sched != 'constant' else None
             train_and_evaluate(model, model, original, torch.nn.CrossEntropyLoss().to(device), loaders,
-                optimizer, scheduler, device, class_mask=masks, args=args, boundary_observer=observer)
-            # Reinspect actual emitted checkpoints and verify snapshots came from their own boundary.
-            report, extracted = inventory(output / 'checkpoint', output, trusted=True)
+                optimizer, scheduler, device, class_mask=masks, args=args, boundary_observer=observer,
+                save_checkpoints=config.get('save_checkpoints', True))
+            # The online collector owns each boundary snapshot; full model files are optional.
             for task in range(10):
-                if tensor_hash(bank.select(task, 9, 'cpu')) != tensor_hash(extracted.select(task, 9, 'cpu')):
-                    raise ValueError('Collected snapshot differs from emitted checkpoint boundary')
-            extracted.save(output / 'frequency_bank.json')
+                bank.select(task, 9, 'cpu')  # Reject missing slots even when metrics look complete.
+            if config.get('save_checkpoints', True):
+                report, extracted = inventory(output / 'checkpoint', output, trusted=True)
+                for task in range(10):
+                    if tensor_hash(bank.select(task, 9, 'cpu')) != tensor_hash(extracted.select(task, 9, 'cpu')):
+                        raise ValueError('Collected snapshot differs from emitted checkpoint boundary')
+            bank.save(output / 'frequency_bank.json')
+            json_write(output / 'training_manifest.json', dict(status='trained', num_tasks=args.num_tasks,
+                epochs_per_task=args.epochs, source_checkpoints_required=False,
+                save_checkpoints=config.get('save_checkpoints', True), completed_boundaries=list(range(1, 11))))
         checks_pass = len(observer.checks) == 10 and all(c['passed'] for c in observer.checks)
         summary = write_metrics(output, matrices, process_success=True, checks_pass=checks_pass)
         if not summary['full_protocol_complete']:

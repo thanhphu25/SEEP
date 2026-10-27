@@ -1,14 +1,16 @@
 {
   "validation": "clean pinned checkout + embedded patch + synthetic CPU tests",
   "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
-  "patch_sha256": "f525afc40a282641f8094a90f85ac8ff1886dc9548d1573c116b1a2541bf0ed9",
+  "patch_sha256": "81a06957d4d82bf4d594456518aedcf0bb289d5215b15aba17a627ab7621ae9a",
   "all_source_hashes_match": true,
   "notebook_code_cells_parse": true,
   "notebook_has_no_outputs": true,
+  "notebook_default_run_mode": "train_collect",
+  "notebook_default_save_checkpoints": true,
   "standalone_notebook_rebuild_byte_exact": true,
   "returncode": 0,
   "test_counts": {
-    "tests": 27,
+    "tests": 29,
     "failures": 0,
     "errors": 0,
     "skipped": 0
@@ -16,9 +18,9 @@
   "checkpoint_files_in_delivery": false,
   "full_cub_run": false,
   "actual_environment": {
-    "python": "3.9.25 (main, Oct 31 2025, 22:56:13) [MSC v.1929 64 bit (AMD64)]",
-    "torch": "2.0.1+cpu",
-    "torchvision": "0.15.2+cpu",
+    "python": "3.10.20 | packaged by Anaconda, Inc. | (main, Mar 11 2026, 17:42:35) [MSC v.1942 64 bit (AMD64)]",
+    "torch": "2.11.0+cpu",
+    "torchvision": "0.26.0+cpu",
     "timm": "0.6.11",
     "cuda_available": false
   },

@@ -32,8 +32,11 @@ def verify():
         parsed = ast.parse(''.join(c['source']))
         for node in parsed.body:
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                if node.targets[0].id in ('PATCH_B64', 'PATCH_SHA256', 'BASE_COMMIT', 'DELIVERY'):
+                if node.targets[0].id in ('PATCH_B64', 'PATCH_SHA256', 'BASE_COMMIT', 'DELIVERY',
+                                        'RUN_MODE', 'SAVE_CHECKPOINTS'):
                     literals[node.targets[0].id] = ast.literal_eval(node.value)
+    assert literals['RUN_MODE'] == 'train_collect'
+    assert literals['SAVE_CHECKPOINTS'] is True
     patch = base64.b64decode(literals['PATCH_B64'])
     assert hashlib.sha256(patch).hexdigest() == manifest['patch_sha256'] == literals['PATCH_SHA256']
     assert patch == (ROOT / 'frequency_state_implementation.patch').read_bytes()
@@ -67,6 +70,7 @@ def verify():
     report = dict(validation='clean pinned checkout + embedded patch + synthetic CPU tests',
         base_commit=manifest['base_commit'], patch_sha256=manifest['patch_sha256'],
         all_source_hashes_match=True, notebook_code_cells_parse=True, notebook_has_no_outputs=True,
+        notebook_default_run_mode=literals['RUN_MODE'], notebook_default_save_checkpoints=literals['SAVE_CHECKPOINTS'],
         standalone_notebook_rebuild_byte_exact=True,
         returncode=result.returncode, test_counts=totals, checkpoint_files_in_delivery=False,
         full_cub_run=False, actual_environment=dict(python=sys.version, torch=torch.__version__,

@@ -447,6 +447,84 @@ def test_runner_missing_checkpoints_failure_archives_false_completion(tmp_path):
     assert (tmp_path / 'SEEP_FREQUENCY_STATE_CUB200_metrics.zip').is_file()
 
 
+@pytest.mark.parametrize('save_checkpoints', [True, False])
+def test_actual_runner_full_training_without_checkpoint_input(tmp_path, monkeypatch, save_checkpoints):
+    """Train all ten boundaries without source checkpoints; save outputs by default."""
+    import engine
+    import datasets
+    import modules.frequency_state as frequency_state
+    import tools.frequency_run as runtime
+    from vision_transformer import VisionTransformer
+    args = runtime.default_args()
+    args.input_size, args.nb_classes, args.epochs, args.warm_up = 16, 7, 2, 0
+    opts = {**options(), 'n_tasks': 10, 'pool_size': 10}
+    loader = DataLoader(TensorDataset(torch.randn(2, 3, 16, 16), torch.tensor([0, 1])), batch_size=32)
+    loaders, masks = [dict(train=loader, val=loader) for _ in range(10)], [[0, 1]] * 10
+    monkeypatch.setattr(runtime, 'default_args', lambda: args)
+    monkeypatch.setattr(runtime, 'validate_config', lambda args: None)
+    monkeypatch.setattr(runtime, 'pretrained', lambda p, output: p)
+    def build_models(a, path):
+        model = VisionTransformer(**{**opts, 'args': a})
+        for name, param in model.named_parameters():
+            if name.startswith(tuple(a.freeze)):
+                param.requires_grad_(False)
+        return model, Original()
+    monkeypatch.setattr(runtime, 'build_models', build_models)
+    monkeypatch.setattr(runtime, 'verify_original', lambda *a: {'synthetic_test': True})
+    monkeypatch.setattr(runtime, 'require_gpu', lambda args: None)
+    monkeypatch.setattr(runtime, 'split_manifest', lambda *a: {'sha256': json.loads(
+        (ROOT / 'references/align_only_seed3407/provenance.json').read_text())['split_sha256']})
+    monkeypatch.setattr(datasets, 'build_continual_dataloader', lambda args: (loaders, masks))
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
+    def forbidden(*a, **kw): raise AssertionError('Fresh training touched a full model checkpoint')
+    monkeypatch.setattr(runtime, 'load_checkpoint', forbidden)
+    output = tmp_path / 'output'; output.mkdir()
+    if save_checkpoints:
+        # Permit tiny synthetic protocol dimensions; validate the real emitted files.
+        monkeypatch.setattr(frequency_state, 'validate_config', lambda args: None)
+        def output_inventory(root, target, **kwargs):
+            assert Path(root) == output / 'checkpoint' and Path(target) == output
+            return inventory(root, target, **kwargs)
+        monkeypatch.setattr(runtime, 'inventory', output_inventory)
+    else:
+        monkeypatch.setattr(runtime, 'inventory', forbidden)
+        monkeypatch.setattr(torch, 'load', forbidden)
+        monkeypatch.setattr(engine.utils, 'save_on_master', forbidden)
+    (output / 'tests_result.json').write_text(json.dumps(dict(returncode=0)))
+    # No checkpoint input fields; omission of save_checkpoints must save outputs.
+    run_config = dict(output=str(output), run_mode='train_collect', data_path='synthetic',
+                      npz_path='synthetic', device='cpu', num_workers=0)
+    if not save_checkpoints:
+        run_config['save_checkpoints'] = False
+    runtime.run(run_config)
+    summary = json.loads((output / 'summary.json').read_text())
+    assert summary['full_protocol_complete']
+    assert all(m['observed_cells'] == 55 for m in summary['metrics'].values())
+    bank = json.loads((output / 'frequency_bank.json').read_text())
+    assert len(bank['slots']) == 10 and bank['tensor_values'] == 1030
+    manifest = json.loads((output / 'training_manifest.json').read_text())
+    assert manifest['completed_boundaries'] == list(range(1, 11))
+    assert manifest['save_checkpoints'] is save_checkpoints and not manifest['source_checkpoints_required']
+    config = json.loads((output / 'run_config.json').read_text())
+    assert config['optimizer_created'] and config['lr_rescaled']
+    assert config['save_checkpoints'] is save_checkpoints
+    assert config['actual_args']['lr'] == .00375
+    if save_checkpoints:
+        assert len(list((output / 'checkpoint').glob('task*_checkpoint.pth'))) == 10
+        for boundary in range(1, 11):
+            saved, state, _, _ = load_checkpoint(output / f'checkpoint/task{boundary}_checkpoint.pth', trusted=True)
+            assert saved['epoch'] == 1 and 'optimizer' in saved and 'lr_scheduler' in saved
+            assert bank['slots'][boundary - 1]['sha256'] == tensor_hash(state_from(state))
+    else:
+        assert not (output / 'checkpoint').exists()
+        assert not any(output.rglob('*.pth'))
+    # Retrying cannot overwrite a completed bank or metrics.
+    before = (output / 'summary.json').read_bytes()
+    with pytest.raises(ValueError, match='fresh output'):
+        runtime.run(dict(output=str(output), run_mode='train_collect'))
+    assert before == (output / 'summary.json').read_bytes()
+
+
 def test_actual_engine_observer_keeps_training_losses_states_optimizer_and_rng(tmp_path, monkeypatch):
     import engine
     from tools.frequency_run import default_args
@@ -454,14 +532,14 @@ def test_actual_engine_observer_keeps_training_losses_states_optimizer_and_rng(t
     from timm.optim import create_optimizer
     from timm.scheduler import create_scheduler
     monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
-    def trajectory(enabled):
+    def trajectory(enabled, save_checkpoints=True):
         set_seed(812)
         args = default_args()
         args.input_size, args.num_tasks, args.num_tasks_to_run = 16, 3, 2
         args.nb_classes = 7
         args.epochs, args.warm_up, args.device = 2, 0, 'cpu'
         args.lr *= 32 / 256
-        output = tmp_path / ('on' if enabled else 'off'); output.mkdir()
+        output = tmp_path / (('on' if enabled else 'off') + ('_saved' if save_checkpoints else '_unsaved')); output.mkdir()
         args.output_dir = str(output)
         from vision_transformer import VisionTransformer
         model = VisionTransformer(**{**options(), 'args': args})
@@ -477,16 +555,31 @@ def test_actual_engine_observer_keeps_training_losses_states_optimizer_and_rng(t
         scheduler = create_scheduler(args, optimizer)[0]
         bank = FrequencyBank()
         collector = Collector(output, {k: np.full((10, 10), np.nan) for k in CHANNELS}, bank) if enabled else None
-        engine.train_and_evaluate(model, model, original, nn.CrossEntropyLoss(), loaders, optimizer,
-            scheduler, torch.device('cpu'), masks, args, boundary_observer=collector)
-        saved, state, _, _ = load_checkpoint(output / 'checkpoint/task2_checkpoint.pth', True)
+        optimizers = []
+        def track_optimizer(*a, **kw):
+            result = create_optimizer(*a, **kw)
+            optimizers.append(result)
+            return result
+        with monkeypatch.context() as patch:
+            patch.setattr(engine, 'create_optimizer', track_optimizer)
+            engine.train_and_evaluate(model, model, original, nn.CrossEntropyLoss(), loaders, optimizer,
+                scheduler, torch.device('cpu'), masks, args, boundary_observer=collector,
+                save_checkpoints=save_checkpoints)
+        state, optimizer_state = model.state_dict(), optimizers[-1].state_dict()
+        if save_checkpoints:
+            saved, restored, _, _ = load_checkpoint(output / 'checkpoint/task2_checkpoint.pth', True)
+            assert tensor_hash(state) == tensor_hash(restored)
+            optimizer_state = saved['optimizer']
+        else:
+            assert not (output / 'checkpoint').exists()
         records = [json.loads(line) for file in output.glob('*_stats.txt') for line in file.read_text().splitlines()]
         losses = [r['train_Loss'] for r in records if 'train_Loss' in r]
         assert len(losses) == 2
-        return losses, tensor_hash(state), saved['optimizer'], torch.get_rng_state()
-    off, on = trajectory(False), trajectory(True)
-    assert off[:2] == on[:2] and torch.equal(off[3], on[3])
-    for key in off[2]['state']:
-        for field, value in off[2]['state'][key].items():
-            other = on[2]['state'][key][field]
-            assert torch.equal(value, other) if torch.is_tensor(value) else value == other
+        return losses, tensor_hash(state), optimizer_state, torch.get_rng_state()
+    off = trajectory(False)
+    for on in (trajectory(True), trajectory(True, save_checkpoints=False)):
+        assert off[:2] == on[:2] and torch.equal(off[3], on[3])
+        for key in off[2]['state']:
+            for field, value in off[2]['state'][key].items():
+                other = on[2]['state'][key][field]
+                assert torch.equal(value, other) if torch.is_tensor(value) else value == other

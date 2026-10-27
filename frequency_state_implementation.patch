@@ -121,11 +121,20 @@ diff --git a/engine.py b/engine.py
  def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Module, original_model: torch.nn.Module, 
                      criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer, lr_scheduler, device: torch.device, 
 -                    class_mask=None, args = None,):
-+                    class_mask=None, args = None, boundary_observer=None,):
++                    class_mask=None, args = None, boundary_observer=None, save_checkpoints=True,):
  
      # create matrix to save end-of-task accuracies 
      acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
-@@ -327,8 +327,12 @@
+@@ -301,7 +301,7 @@
+ 
+         # Resume capability: Check if checkpoint exists
+         checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
+-        if os.path.exists(checkpoint_path):
++        if save_checkpoints and os.path.exists(checkpoint_path):
+             print(f"Checkpoint found at {checkpoint_path}. Resuming...")
+             checkpoint = torch.load(checkpoint_path)
+             _prepare_dynamic_buffers_for_checkpoint(model_without_ddp, checkpoint['model'])
+@@ -327,9 +327,13 @@
                  lr_scheduler.step(epoch)
          
          
@@ -133,11 +142,13 @@ diff --git a/engine.py b/engine.py
 +            boundary_observer.capture(model_without_ddp, task_id)
          test_stats = evaluate_till_now(model=model, original_model=original_model, data_loader=data_loader, device=device, 
                                      task_id=task_id, class_mask=class_mask, acc_matrix=acc_matrix, args=args)
+-        if args.output_dir and utils.is_main_process():
 +        if boundary_observer is not None:
 +            boundary_observer.evaluate(model_without_ddp, original_model, data_loader, device, task_id, class_mask)
-         if args.output_dir and utils.is_main_process():
++        if save_checkpoints and args.output_dir and utils.is_main_process():
              Path(os.path.join(args.output_dir, 'checkpoint')).mkdir(parents=True, exist_ok=True)
  
+             checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
 @@ -350,4 +354,4 @@
  
          if args.output_dir and utils.is_main_process():
@@ -703,8 +714,8 @@ diff --git a/tools/frequency_run.py b/tools/frequency_run.py
 new file mode 100644
 --- /dev/null
 +++ b/tools/frequency_run.py
-@@ -0,0 +1,373 @@
-+"""Paired raw SEEP frequency-state evaluation; reeval never builds an optimizer."""
+@@ -0,0 +1,386 @@
++"""Full SEEP training with online paired evaluation, or explicit checkpoint reeval."""
 +import argparse
 +import csv
 +import gc
@@ -867,7 +878,7 @@ new file mode 100644
 +    summary = dict(full_protocol_complete=complete, process_success=process_success, checks_pass=checks_pass,
 +        metrics=metrics, snapshot_minus_live_percentage_points=deltas, screening_signal=signal,
 +        forgetting_goal=None if signal is None else bool(signal and primary['final_forgetting'] < 0),
-+        primary='paired raw_exact on the same checkpoint trajectory',
++        primary='paired raw_exact on the same model trajectory',
 +        interpretation='One seed; screening rule is not statistical significance. Inspect peaks with forgetting. '
 +        'No test-based state tuning or novelty/zero-forgetting claim.',
 +        historical_reference_only=dict(original=[87.5441, 86.4980, 2.9515],
@@ -908,10 +919,15 @@ new file mode 100644
 +        raise ValueError('run_mode must be reeval or train_collect')
 +    # Fresh run only; never resume silently from final checkpoint or overwrite old metrics/bank.
 +    if (output / 'checkpoint').exists() or (output / 'frequency_bank.json').exists():
-+        raise ValueError('train_collect requires a fresh output. Interrupted collected checkpoints remain usable for explicit reeval; '
-+                         'training resume is intentionally unsupported, so boundary metrics/snapshots cannot duplicate.')
-+    json_write(output / 'checkpoint_inventory.json', dict(status='new_train_collect', missing_boundaries=list(range(1, 11)),
-+        full_trajectory=False, note='New full 10x30 run. No final-checkpoint resume.'))
++        raise ValueError('train_collect requires a fresh output. Training resume is intentionally unsupported, '
++                         'so boundary metrics/snapshots cannot duplicate.')
++    save_checkpoints = config.get('save_checkpoints', True)
++    if type(save_checkpoints) is not bool:
++        raise ValueError('save_checkpoints must be a JSON boolean')
++    json_write(output / 'checkpoint_inventory.json', dict(status='not_required', missing_boundaries=[],
++        full_trajectory=False, note='Fresh full 10x30 training directly from CUB images; no source checkpoints.'))
++    json_write(output / 'training_manifest.json', dict(status='configured', num_tasks=10, epochs_per_task=30,
++        source_checkpoints_required=False, save_checkpoints=save_checkpoints, completed_boundaries=[]))
 +    return None, FrequencyBank()
 +
 +
@@ -976,6 +992,7 @@ new file mode 100644
 +        model, original = build_models(args, npz)
 +        json_write(output / 'run_config.json', dict(mode=config['run_mode'], saved_args=saved, actual_args=vars(args),
 +            path_overrides=overrides, optimizer_created=config['run_mode'] == 'train_collect', lr_rescaled=report is None,
++            save_checkpoints=config.get('save_checkpoints', True) if report is None else False,
 +            class_order=list(range(200)), cudnn_benchmark=torch.backends.cudnn.benchmark))
 +        import torchvision, timm
 +        json_write(output / 'environment.json', dict(python=sys.version, platform=platform.platform(), torch=torch.__version__,
@@ -1037,13 +1054,20 @@ new file mode 100644
 +            optimizer = create_optimizer(args, model)
 +            scheduler = create_scheduler(args, optimizer)[0] if args.sched != 'constant' else None
 +            train_and_evaluate(model, model, original, torch.nn.CrossEntropyLoss().to(device), loaders,
-+                optimizer, scheduler, device, class_mask=masks, args=args, boundary_observer=observer)
-+            # Reinspect actual emitted checkpoints and verify snapshots came from their own boundary.
-+            report, extracted = inventory(output / 'checkpoint', output, trusted=True)
++                optimizer, scheduler, device, class_mask=masks, args=args, boundary_observer=observer,
++                save_checkpoints=config.get('save_checkpoints', True))
++            # The online collector owns each boundary snapshot; full model files are optional.
 +            for task in range(10):
-+                if tensor_hash(bank.select(task, 9, 'cpu')) != tensor_hash(extracted.select(task, 9, 'cpu')):
-+                    raise ValueError('Collected snapshot differs from emitted checkpoint boundary')
-+            extracted.save(output / 'frequency_bank.json')
++                bank.select(task, 9, 'cpu')  # Reject missing slots even when metrics look complete.
++            if config.get('save_checkpoints', True):
++                report, extracted = inventory(output / 'checkpoint', output, trusted=True)
++                for task in range(10):
++                    if tensor_hash(bank.select(task, 9, 'cpu')) != tensor_hash(extracted.select(task, 9, 'cpu')):
++                        raise ValueError('Collected snapshot differs from emitted checkpoint boundary')
++            bank.save(output / 'frequency_bank.json')
++            json_write(output / 'training_manifest.json', dict(status='trained', num_tasks=args.num_tasks,
++                epochs_per_task=args.epochs, source_checkpoints_required=False,
++                save_checkpoints=config.get('save_checkpoints', True), completed_boundaries=list(range(1, 11))))
 +        checks_pass = len(observer.checks) == 10 and all(c['passed'] for c in observer.checks)
 +        summary = write_metrics(output, matrices, process_success=True, checks_pass=checks_pass)
 +        if not summary['full_protocol_complete']:
@@ -1168,7 +1192,7 @@ diff --git a/tools/build_frequency_delivery.py b/tools/build_frequency_delivery.
 new file mode 100644
 --- /dev/null
 +++ b/tools/build_frequency_delivery.py
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,223 @@
 +"""Build a standalone Kaggle notebook from LF source files against the pinned base."""
 +import base64
 +import difflib
@@ -1225,25 +1249,26 @@ new file mode 100644
 +    cells = [cell('markdown', '''
 +        # SEEP frequency-state recall — CUB200, seed 3407
 +
-+        Enable **GPU + Internet**. Add Input `trungkiennguyn/lgsp-dataset` and
-+        **your original SEEP task1..task10 checkpoints from the same run**.
-+        Attach Inputs before background Save Version. The supplied metrics ZIP
-+        contains no checkpoints. Reeval runs first; missing inputs never trigger training.
++        Enable **GPU + Internet**. Add Input `trungkiennguyn/lgsp-dataset`
++        (official CUB-200-2011 images and metadata). Attach it before background Save Version.
++        Run all cells to train on the full official train split: **5,994 images,
++        10 tasks × 30 epochs**, with paired live/snapshot evaluation after each task.
++        **No checkpoint dataset or upload is needed.** Full model + optimizer
++        checkpoints are saved after each task in the Kaggle output, alongside
++        the frequency bank, metrics and logs.
 +        No CLS Steering / N1 / CCSR / Gaussian alignment / transport is used.
 +        Local validation is synthetic; this notebook has no precomputed CUB result.
 +    '''), cell('code', '''
 +        import sys, os, json, hashlib, base64, subprocess, shutil, time, traceback
 +        from pathlib import Path
-+        RUN_MODE = 'reeval'  # Alternative: 'train_collect' starts a NEW full 10 x 30 run.
-+        CHECKPOINT_ROOT = '/kaggle/input'
-+        CHECKPOINT_MAP = None  # JSON path or dict {"1": "/kaggle/input/my-run/task1_checkpoint.pth", ... "10": ...}
-+        TRUSTED_CHECKPOINTS = False  # True ONLY for your own trusted Namespace/pickle checkpoints.
++        RUN_MODE = 'train_collect'  # NEW full 10 x 30 run from images; no SEEP checkpoint input.
++        SAVE_CHECKPOINTS = True  # Save each task's model + optimizer in OUTPUT/checkpoint (separate from metrics ZIP).
 +        DATA_ROOT = None  # Set official CUB root here if discovery finds duplicates.
 +        REPO = Path('/kaggle/working/SEEP_Frequency_State')
 +        READY = Path('/kaggle/working/cub200_ready_frequency_state')
 +        OUTPUT = Path('/kaggle/working/seep_frequency_state_seed3407')
 +        NPZ_PATH = Path('/kaggle/working/pretrained/ViT-B_16.npz')
-+        assert RUN_MODE in ('reeval', 'train_collect')
++        assert RUN_MODE == 'train_collect', 'This notebook trains from images. See README for explicit checkpoint reeval.'
 +        assert not OUTPUT.exists(), 'Use a fresh OUTPUT directory to preserve previous results.'
 +        OUTPUT.mkdir(parents=True)
 +        (OUTPUT/'run_status.json').write_text(json.dumps({'status':'configured','full_protocol_complete':False}))
@@ -1269,10 +1294,8 @@ new file mode 100644
 +            print('Failed/partial archive:',archive)
 +        if 'get_ipython' in globals():
 +            get_ipython().events.register('post_run_cell',record_cell_failure)
-+        files = sorted(p for p in Path(CHECKPOINT_ROOT).rglob('*')
-+                       if p.is_file() and p.suffix.lower() in {'.pth','.pt','.ckpt'})
-+        print('Checkpoint candidate files (not yet loaded/validated):', len(files))
-+        for p in files[:40]: print(f'{p.stat().st_size/2**20:.1f} MiB  {p}')
++        print('Full CUB training: 10 tasks x 30 epochs; no source checkpoints.')
++        print('Save full model checkpoints:', SAVE_CHECKPOINTS)
 +    '''), cell('code', f'''
 +        BASE_COMMIT = {BASE!r}
 +        PATCH_SHA256 = {sha!r}
@@ -1334,17 +1357,14 @@ new file mode 100644
 +        checked_command([sys.executable,'-m','pytest','-q','tests/test_frequency_state.py',
 +                         '-p','no:cacheprovider','--junitxml='+str(OUTPUT/'tests.xml')], 'tests')
 +    '''), cell('code', '''
-+        CONFIG = dict(run_mode=RUN_MODE,checkpoint_root=CHECKPOINT_ROOT,checkpoint_map=CHECKPOINT_MAP,
-+            trusted_checkpoints=TRUSTED_CHECKPOINTS,data_path=str(READY),output=str(OUTPUT),
++        CONFIG = dict(run_mode=RUN_MODE,save_checkpoints=SAVE_CHECKPOINTS,
++            data_path=str(READY),output=str(OUTPUT),
 +            npz_path=str(NPZ_PATH),device='cuda:0',num_workers=4)
 +        CONFIG_PATH = OUTPUT/'notebook_config.json'
 +        CONFIG_PATH.write_text(json.dumps(CONFIG,indent=2))
-+        # Inventory and extraction happen BEFORE expensive evaluation. No images or optimizer step.
++        # Check the fresh output and training plan. No checkpoint discovery or loading.
 +        checked_command([sys.executable,'tools/frequency_run.py','--config',str(CONFIG_PATH),'--inventory-only'], 'inventory')
-+        report=json.loads((OUTPUT/'checkpoint_inventory.json').read_text())
-+        for row in report.get('boundaries',[]):
-+            print(row['boundary'],row['status'],'epoch=',row.get('epoch'),'path=',row['path'])
-+        print('Missing:',report.get('missing_boundaries',[]))
++        print(json.dumps(json.loads((OUTPUT/'training_manifest.json').read_text()),indent=2))
 +    '''), cell('code', '''
 +        # Official metadata + split hashes, never a random train/test split.
 +        checked_command([sys.executable,'-c',
@@ -1352,8 +1372,8 @@ new file mode 100644
 +            +repr(None if DATA_ROOT is None else str(DATA_ROOT))+","+repr(str(READY))+"),indent=2))"], 'data')
 +        shutil.copyfile(READY/'official_split_manifest.json',OUTPUT/'official_split_manifest.json')
 +    '''), cell('code', '''
-+        # Full preflight verifies saved args, frozen routing NPZ, strict dynamic load, transforms and GPU.
-+        # The runner performs that preflight before evaluating any boundary. No optimizer in reeval.
++        # Preflight verifies the full official split, fresh args, routing NPZ, transforms and GPU.
++        # Train all 10 tasks, collect tiny snapshots and evaluate both branches online.
 +        # Progress includes boundary/task/images/elapsed/ETA; all stdout is retained in run.log.
 +        checked_command([sys.executable,'tools/frequency_run.py','--config',str(CONFIG_PATH)], 'evaluation')
 +    '''), cell('code', '''
@@ -1374,6 +1394,8 @@ new file mode 100644
 +        from IPython.display import display, FileLink
 +        print('Metrics ZIP (no model checkpoints):',archive)
 +        display(FileLink(str(archive)))
++        if SAVE_CHECKPOINTS:
++            print('Model checkpoints (saved in Kaggle output):',OUTPUT/'checkpoint')
 +    ''')]
 +    notebook = dict(cells=cells, metadata=dict(kernelspec=dict(display_name='Python 3', language='python', name='python3'),
 +        language_info=dict(name='python'), kaggle=dict(isGpuEnabled=True, isInternetEnabled=True)), nbformat=4, nbformat_minor=5)
@@ -1398,7 +1420,7 @@ diff --git a/tools/verify_frequency_delivery.py b/tools/verify_frequency_deliver
 new file mode 100644
 --- /dev/null
 +++ b/tools/verify_frequency_delivery.py
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,95 @@
 +"""Reconstruct the embedded patch on a clean pinned checkout and run CPU tests."""
 +import ast
 +import base64
@@ -1433,8 +1455,11 @@ new file mode 100644
 +        parsed = ast.parse(''.join(c['source']))
 +        for node in parsed.body:
 +            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-+                if node.targets[0].id in ('PATCH_B64', 'PATCH_SHA256', 'BASE_COMMIT', 'DELIVERY'):
++                if node.targets[0].id in ('PATCH_B64', 'PATCH_SHA256', 'BASE_COMMIT', 'DELIVERY',
++                                        'RUN_MODE', 'SAVE_CHECKPOINTS'):
 +                    literals[node.targets[0].id] = ast.literal_eval(node.value)
++    assert literals['RUN_MODE'] == 'train_collect'
++    assert literals['SAVE_CHECKPOINTS'] is True
 +    patch = base64.b64decode(literals['PATCH_B64'])
 +    assert hashlib.sha256(patch).hexdigest() == manifest['patch_sha256'] == literals['PATCH_SHA256']
 +    assert patch == (ROOT / 'frequency_state_implementation.patch').read_bytes()
@@ -1468,6 +1493,7 @@ new file mode 100644
 +    report = dict(validation='clean pinned checkout + embedded patch + synthetic CPU tests',
 +        base_commit=manifest['base_commit'], patch_sha256=manifest['patch_sha256'],
 +        all_source_hashes_match=True, notebook_code_cells_parse=True, notebook_has_no_outputs=True,
++        notebook_default_run_mode=literals['RUN_MODE'], notebook_default_save_checkpoints=literals['SAVE_CHECKPOINTS'],
 +        standalone_notebook_rebuild_byte_exact=True,
 +        returncode=result.returncode, test_counts=totals, checkpoint_files_in_delivery=False,
 +        full_cub_run=False, actual_environment=dict(python=sys.version, torch=torch.__version__,
@@ -1494,7 +1520,7 @@ diff --git a/tests/test_frequency_state.py b/tests/test_frequency_state.py
 new file mode 100644
 --- /dev/null
 +++ b/tests/test_frequency_state.py
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,585 @@
 +import copy
 +import json
 +import subprocess
@@ -1944,6 +1970,84 @@ new file mode 100644
 +    assert (tmp_path / 'SEEP_FREQUENCY_STATE_CUB200_metrics.zip').is_file()
 +
 +
++@pytest.mark.parametrize('save_checkpoints', [True, False])
++def test_actual_runner_full_training_without_checkpoint_input(tmp_path, monkeypatch, save_checkpoints):
++    """Train all ten boundaries without source checkpoints; save outputs by default."""
++    import engine
++    import datasets
++    import modules.frequency_state as frequency_state
++    import tools.frequency_run as runtime
++    from vision_transformer import VisionTransformer
++    args = runtime.default_args()
++    args.input_size, args.nb_classes, args.epochs, args.warm_up = 16, 7, 2, 0
++    opts = {**options(), 'n_tasks': 10, 'pool_size': 10}
++    loader = DataLoader(TensorDataset(torch.randn(2, 3, 16, 16), torch.tensor([0, 1])), batch_size=32)
++    loaders, masks = [dict(train=loader, val=loader) for _ in range(10)], [[0, 1]] * 10
++    monkeypatch.setattr(runtime, 'default_args', lambda: args)
++    monkeypatch.setattr(runtime, 'validate_config', lambda args: None)
++    monkeypatch.setattr(runtime, 'pretrained', lambda p, output: p)
++    def build_models(a, path):
++        model = VisionTransformer(**{**opts, 'args': a})
++        for name, param in model.named_parameters():
++            if name.startswith(tuple(a.freeze)):
++                param.requires_grad_(False)
++        return model, Original()
++    monkeypatch.setattr(runtime, 'build_models', build_models)
++    monkeypatch.setattr(runtime, 'verify_original', lambda *a: {'synthetic_test': True})
++    monkeypatch.setattr(runtime, 'require_gpu', lambda args: None)
++    monkeypatch.setattr(runtime, 'split_manifest', lambda *a: {'sha256': json.loads(
++        (ROOT / 'references/align_only_seed3407/provenance.json').read_text())['split_sha256']})
++    monkeypatch.setattr(datasets, 'build_continual_dataloader', lambda args: (loaders, masks))
++    monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
++    def forbidden(*a, **kw): raise AssertionError('Fresh training touched a full model checkpoint')
++    monkeypatch.setattr(runtime, 'load_checkpoint', forbidden)
++    output = tmp_path / 'output'; output.mkdir()
++    if save_checkpoints:
++        # Permit tiny synthetic protocol dimensions; validate the real emitted files.
++        monkeypatch.setattr(frequency_state, 'validate_config', lambda args: None)
++        def output_inventory(root, target, **kwargs):
++            assert Path(root) == output / 'checkpoint' and Path(target) == output
++            return inventory(root, target, **kwargs)
++        monkeypatch.setattr(runtime, 'inventory', output_inventory)
++    else:
++        monkeypatch.setattr(runtime, 'inventory', forbidden)
++        monkeypatch.setattr(torch, 'load', forbidden)
++        monkeypatch.setattr(engine.utils, 'save_on_master', forbidden)
++    (output / 'tests_result.json').write_text(json.dumps(dict(returncode=0)))
++    # No checkpoint input fields; omission of save_checkpoints must save outputs.
++    run_config = dict(output=str(output), run_mode='train_collect', data_path='synthetic',
++                      npz_path='synthetic', device='cpu', num_workers=0)
++    if not save_checkpoints:
++        run_config['save_checkpoints'] = False
++    runtime.run(run_config)
++    summary = json.loads((output / 'summary.json').read_text())
++    assert summary['full_protocol_complete']
++    assert all(m['observed_cells'] == 55 for m in summary['metrics'].values())
++    bank = json.loads((output / 'frequency_bank.json').read_text())
++    assert len(bank['slots']) == 10 and bank['tensor_values'] == 1030
++    manifest = json.loads((output / 'training_manifest.json').read_text())
++    assert manifest['completed_boundaries'] == list(range(1, 11))
++    assert manifest['save_checkpoints'] is save_checkpoints and not manifest['source_checkpoints_required']
++    config = json.loads((output / 'run_config.json').read_text())
++    assert config['optimizer_created'] and config['lr_rescaled']
++    assert config['save_checkpoints'] is save_checkpoints
++    assert config['actual_args']['lr'] == .00375
++    if save_checkpoints:
++        assert len(list((output / 'checkpoint').glob('task*_checkpoint.pth'))) == 10
++        for boundary in range(1, 11):
++            saved, state, _, _ = load_checkpoint(output / f'checkpoint/task{boundary}_checkpoint.pth', trusted=True)
++            assert saved['epoch'] == 1 and 'optimizer' in saved and 'lr_scheduler' in saved
++            assert bank['slots'][boundary - 1]['sha256'] == tensor_hash(state_from(state))
++    else:
++        assert not (output / 'checkpoint').exists()
++        assert not any(output.rglob('*.pth'))
++    # Retrying cannot overwrite a completed bank or metrics.
++    before = (output / 'summary.json').read_bytes()
++    with pytest.raises(ValueError, match='fresh output'):
++        runtime.run(dict(output=str(output), run_mode='train_collect'))
++    assert before == (output / 'summary.json').read_bytes()
++
++
 +def test_actual_engine_observer_keeps_training_losses_states_optimizer_and_rng(tmp_path, monkeypatch):
 +    import engine
 +    from tools.frequency_run import default_args
@@ -1951,14 +2055,14 @@ new file mode 100644
 +    from timm.optim import create_optimizer
 +    from timm.scheduler import create_scheduler
 +    monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
-+    def trajectory(enabled):
++    def trajectory(enabled, save_checkpoints=True):
 +        set_seed(812)
 +        args = default_args()
 +        args.input_size, args.num_tasks, args.num_tasks_to_run = 16, 3, 2
 +        args.nb_classes = 7
 +        args.epochs, args.warm_up, args.device = 2, 0, 'cpu'
 +        args.lr *= 32 / 256
-+        output = tmp_path / ('on' if enabled else 'off'); output.mkdir()
++        output = tmp_path / (('on' if enabled else 'off') + ('_saved' if save_checkpoints else '_unsaved')); output.mkdir()
 +        args.output_dir = str(output)
 +        from vision_transformer import VisionTransformer
 +        model = VisionTransformer(**{**options(), 'args': args})
@@ -1974,24 +2078,39 @@ new file mode 100644
 +        scheduler = create_scheduler(args, optimizer)[0]
 +        bank = FrequencyBank()
 +        collector = Collector(output, {k: np.full((10, 10), np.nan) for k in CHANNELS}, bank) if enabled else None
-+        engine.train_and_evaluate(model, model, original, nn.CrossEntropyLoss(), loaders, optimizer,
-+            scheduler, torch.device('cpu'), masks, args, boundary_observer=collector)
-+        saved, state, _, _ = load_checkpoint(output / 'checkpoint/task2_checkpoint.pth', True)
++        optimizers = []
++        def track_optimizer(*a, **kw):
++            result = create_optimizer(*a, **kw)
++            optimizers.append(result)
++            return result
++        with monkeypatch.context() as patch:
++            patch.setattr(engine, 'create_optimizer', track_optimizer)
++            engine.train_and_evaluate(model, model, original, nn.CrossEntropyLoss(), loaders, optimizer,
++                scheduler, torch.device('cpu'), masks, args, boundary_observer=collector,
++                save_checkpoints=save_checkpoints)
++        state, optimizer_state = model.state_dict(), optimizers[-1].state_dict()
++        if save_checkpoints:
++            saved, restored, _, _ = load_checkpoint(output / 'checkpoint/task2_checkpoint.pth', True)
++            assert tensor_hash(state) == tensor_hash(restored)
++            optimizer_state = saved['optimizer']
++        else:
++            assert not (output / 'checkpoint').exists()
 +        records = [json.loads(line) for file in output.glob('*_stats.txt') for line in file.read_text().splitlines()]
 +        losses = [r['train_Loss'] for r in records if 'train_Loss' in r]
 +        assert len(losses) == 2
-+        return losses, tensor_hash(state), saved['optimizer'], torch.get_rng_state()
-+    off, on = trajectory(False), trajectory(True)
-+    assert off[:2] == on[:2] and torch.equal(off[3], on[3])
-+    for key in off[2]['state']:
-+        for field, value in off[2]['state'][key].items():
-+            other = on[2]['state'][key][field]
-+            assert torch.equal(value, other) if torch.is_tensor(value) else value == other
++        return losses, tensor_hash(state), optimizer_state, torch.get_rng_state()
++    off = trajectory(False)
++    for on in (trajectory(True), trajectory(True, save_checkpoints=False)):
++        assert off[:2] == on[:2] and torch.equal(off[3], on[3])
++        for key in off[2]['state']:
++            for field, value in off[2]['state'][key].items():
++                other = on[2]['state'][key][field]
++                assert torch.equal(value, other) if torch.is_tensor(value) else value == other
 diff --git a/README_FREQUENCY_STATE.md b/README_FREQUENCY_STATE.md
 new file mode 100644
 --- /dev/null
 +++ b/README_FREQUENCY_STATE.md
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,146 @@
 +# SEEP task frequency-state recall — CUB200 / seed 3407
 +
 +This implementation tests one mechanism: recall the frequency state belonging to
@@ -1999,44 +2118,61 @@ new file mode 100644
 +loss, classifier, representation module, Gaussian alignment, or transport.
 +
 +Import `SEEP_Frequency_State_CUB200_Kaggle.ipynb` into Kaggle. Enable GPU and
-+Internet. Add Input `trungkiennguyn/lgsp-dataset` and your own trusted original
-+SEEP checkpoint dataset. For background Save Version, attach both datasets with
++Internet. Add Input `trungkiennguyn/lgsp-dataset` containing official CUB images
++and metadata. **No SEEP checkpoint dataset or upload is needed.**
++For background Save Version, attach the image dataset with
 +Add Input first; do not rely on an interactive kagglehub attachment persisting.
 +The notebook can discover official CUB metadata or attach the image dataset with
 +kagglehub. If the dataset lacks official metadata it stops and requests an
 +official CUB-200-2011 Input. It never creates a random split.
 +
-+## Two explicit modes
++## Full training from images (default)
 +
-+`RUN_MODE = 'reeval'` is the default. It performs no training, optimizer creation,
-+or head fitting. Supply boundaries 1..10 from the same original SEEP run. The
-+default discovery pattern is `task1_checkpoint.pth` ... `task10_checkpoint.pth`.
-+For different filenames, multiple runs, or duplicate boundaries, set
-+`CHECKPOINT_MAP` to a JSON path or dictionary of **one-based** boundaries to
-+absolute Input paths, for example `{"1": "/kaggle/input/my-run/task1_checkpoint.pth"}`
-+(include all 10 entries). The bank itself uses **zero-based** task indices.
-+Checkpoint files are read in place on CPU one at a time; they are not copied to
-+working and optimizer payloads are released before model evaluation.
-+
-+Namespace checkpoints require `TRUSTED_CHECKPOINTS = True` for your own trusted
-+files. This explicitly enables pickle loading on current PyTorch. Unidentified
-+files, CLS Steering, N1, CCSR and DGCA transport checkpoints are rejected.
-+DGCA `align_only` checkpoints may supply `experiment_config` instead of `args`;
-+only their raw SEEP model is used. A lone `dgca_latest.pth` is not a trajectory.
-+If metadata cannot prove common run lineage/commit/environment, the inventory
-+records that limitation even when tensor/config consistency checks pass.
-+
-+`RUN_MODE = 'train_collect'` explicitly starts a **new full 10 × 30 epoch run**.
++`RUN_MODE = 'train_collect'` is the notebook default. Run all cells to start a
++**new full 10 × 30 epoch run** using all 5,994 official training images across
++200 classes. The 5,794 official test images remain evaluation-only.
 +It uses the pinned original training loop and optimizer grouping, with fresh LR
 +.03 scaled once to .00375 (local .0005; frequency .03 before scheduler). The
 +observer clones snapshots after the last scheduler update, before original
-+evaluation. Its paired evaluation preserves RNG, modes and routing attributes.
++evaluation. Both branches are evaluated online after every task, producing the
++complete matrices without reloading model checkpoints. Its paired evaluation
++preserves RNG, modes and routing attributes.
++
++`SAVE_CHECKPOINTS = True` is the default. Training starts directly from images
++without source checkpoints. After each task, the full model, optimizer and
++scheduler state are saved to `OUTPUT/checkpoint/task<N>_checkpoint.pth`.
++These files are part of the Kaggle notebook output; no checkpoint Input dataset
++needs to be created or attached. The frequency bank (4,120 bytes of tensor values
++after 10 tasks, plus JSON metadata), metrics and logs are also saved.
++The verified ImageNet ViT NPZ is downloaded for pretrained initialization.
++
++In runner JSON, `save_checkpoints` defaults to true when omitted. Set
++`SAVE_CHECKPOINTS = False` only if you want to skip saving full model files.
 +Training resume is deliberately unsupported: an existing checkpoint directory
-+or bank is rejected. Use a new output for another run. This prevents replaying
-+metrics or replacing old snapshots; a final checkpoint is never treated as a
-+training resume. Interrupted source checkpoints remain available for explicit
-+reeval when a complete sequence is supplied. Historical 2–3 hour training time
-+is only a reference; measured progress/ETA is printed during execution.
++or bank is rejected. Use a new output for another run. With checkpoint saving
++off, an interrupted training run must be restarted; partial metrics remain
++available. Historical 2–3 hour training time is only a reference.
++
++## Optional checkpoint re-evaluation
++
++The script retains explicit `reeval` support for existing runs. Create a runner
++JSON with `run_mode: "reeval"`, `checkpoint_root`, `trusted_checkpoints`,
++`data_path`, `output` and `npz_path`, then invoke
++`python tools/frequency_run.py --config <config.json>`. Complete the same setup
++and tests first (`tests_result.json` with returncode 0 is required in output).
++This mode performs no training, optimizer creation or head fitting.
++
++Supply boundaries 1..10 from the same original SEEP run. The discovery pattern
++is `task1_checkpoint.pth` ... `task10_checkpoint.pth`. For different filenames or
++duplicate boundaries, provide `checkpoint_map` as a JSON path or dictionary of
++**one-based** boundaries to absolute paths (all 10 entries). The bank itself
++uses **zero-based** task indices. Files are read on CPU one at a time in place.
++
++Set `trusted_checkpoints: true` only for your own trusted Namespace/pickle
++files. Unidentified files, CLS Steering, N1, CCSR and DGCA transport checkpoints
++are rejected. DGCA `align_only` checkpoints may supply `experiment_config`
++instead of `args`; only their raw SEEP model is used. A lone `dgca_latest.pth`
++is not a trajectory. Unknown source lineage/commit/environment is reported.
 +
 +## What the inputs permit
 +
@@ -2088,11 +2224,12 @@ new file mode 100644
 +Default output: `/kaggle/working/seep_frequency_state_seed3407`.
 +`SEEP_FREQUENCY_STATE_CUB200_metrics.zip` contains four full-precision CSV
 +matrices, summaries, per-task initial/peak/final values, comparison deltas,
-+checkpoint/bank provenance, route counts, paired output diagnostics, mutation
++training/bank provenance, route counts, paired output diagnostics, mutation
 +checks, source/split/pretrained manifests, environment, configuration, timing,
 +logs, tests, patch, README and an output-free notebook. Model checkpoints are
-+excluded. In train_collect they remain separately in the working checkpoint
-+directory; retain them separately if needed.
++saved separately in `/kaggle/working/seep_frequency_state_seed3407/checkpoint/`
++by default. They are retained in the Kaggle notebook output and excluded from
++the metrics ZIP.
 +
 +Convention: `A[i,t]` is task i accuracy after boundary t; future cells are NaN.
 +AIA is the average of boundary task means. Final forgetting averages
@@ -2102,7 +2239,7 @@ new file mode 100644
 +passed tests/preflight/mutation checks and successful process exit. Failed or
 +interrupted runs remain failed/partial; CPU synthetic tests are not CUB results.
 +
-+The primary comparison is snapshot minus live from the same checkpoint
++The primary comparison is snapshot minus live from the same model
 +trajectory. Screening requires AIA >= +.3 pp, final > 0 and old-task final > 0;
 +the additional forgetting goal requires F < 0 and interpretation alongside peaks.
 +One seed is not statistical significance. Do not tune slots on test accuracy.

@@ -247,7 +247,7 @@ def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, d
 
 def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Module, original_model: torch.nn.Module, 
                     criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer, lr_scheduler, device: torch.device, 
-                    class_mask=None, args = None, boundary_observer=None,):
+                    class_mask=None, args = None, boundary_observer=None, save_checkpoints=True,):
 
     # create matrix to save end-of-task accuracies 
     acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
@@ -301,7 +301,7 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
 
         # Resume capability: Check if checkpoint exists
         checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))
-        if os.path.exists(checkpoint_path):
+        if save_checkpoints and os.path.exists(checkpoint_path):
             print(f"Checkpoint found at {checkpoint_path}. Resuming...")
             checkpoint = torch.load(checkpoint_path)
             _prepare_dynamic_buffers_for_checkpoint(model_without_ddp, checkpoint['model'])
@@ -333,7 +333,7 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
                                     task_id=task_id, class_mask=class_mask, acc_matrix=acc_matrix, args=args)
         if boundary_observer is not None:
             boundary_observer.evaluate(model_without_ddp, original_model, data_loader, device, task_id, class_mask)
-        if args.output_dir and utils.is_main_process():
+        if save_checkpoints and args.output_dir and utils.is_main_process():
             Path(os.path.join(args.output_dir, 'checkpoint')).mkdir(parents=True, exist_ok=True)
 
             checkpoint_path = os.path.join(args.output_dir, 'checkpoint/task{}_checkpoint.pth'.format(task_id+1))

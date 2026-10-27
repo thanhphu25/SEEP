@@ -54,25 +54,26 @@ def build():
     cells = [cell('markdown', '''
         # SEEP frequency-state recall — CUB200, seed 3407
 
-        Enable **GPU + Internet**. Add Input `trungkiennguyn/lgsp-dataset` and
-        **your original SEEP task1..task10 checkpoints from the same run**.
-        Attach Inputs before background Save Version. The supplied metrics ZIP
-        contains no checkpoints. Reeval runs first; missing inputs never trigger training.
+        Enable **GPU + Internet**. Add Input `trungkiennguyn/lgsp-dataset`
+        (official CUB-200-2011 images and metadata). Attach it before background Save Version.
+        Run all cells to train on the full official train split: **5,994 images,
+        10 tasks × 30 epochs**, with paired live/snapshot evaluation after each task.
+        **No checkpoint dataset or upload is needed.** Full model + optimizer
+        checkpoints are saved after each task in the Kaggle output, alongside
+        the frequency bank, metrics and logs.
         No CLS Steering / N1 / CCSR / Gaussian alignment / transport is used.
         Local validation is synthetic; this notebook has no precomputed CUB result.
     '''), cell('code', '''
         import sys, os, json, hashlib, base64, subprocess, shutil, time, traceback
         from pathlib import Path
-        RUN_MODE = 'reeval'  # Alternative: 'train_collect' starts a NEW full 10 x 30 run.
-        CHECKPOINT_ROOT = '/kaggle/input'
-        CHECKPOINT_MAP = None  # JSON path or dict {"1": "/kaggle/input/my-run/task1_checkpoint.pth", ... "10": ...}
-        TRUSTED_CHECKPOINTS = False  # True ONLY for your own trusted Namespace/pickle checkpoints.
+        RUN_MODE = 'train_collect'  # NEW full 10 x 30 run from images; no SEEP checkpoint input.
+        SAVE_CHECKPOINTS = True  # Save each task's model + optimizer in OUTPUT/checkpoint (separate from metrics ZIP).
         DATA_ROOT = None  # Set official CUB root here if discovery finds duplicates.
         REPO = Path('/kaggle/working/SEEP_Frequency_State')
         READY = Path('/kaggle/working/cub200_ready_frequency_state')
         OUTPUT = Path('/kaggle/working/seep_frequency_state_seed3407')
         NPZ_PATH = Path('/kaggle/working/pretrained/ViT-B_16.npz')
-        assert RUN_MODE in ('reeval', 'train_collect')
+        assert RUN_MODE == 'train_collect', 'This notebook trains from images. See README for explicit checkpoint reeval.'
         assert not OUTPUT.exists(), 'Use a fresh OUTPUT directory to preserve previous results.'
         OUTPUT.mkdir(parents=True)
         (OUTPUT/'run_status.json').write_text(json.dumps({'status':'configured','full_protocol_complete':False}))
@@ -98,10 +99,8 @@ def build():
             print('Failed/partial archive:',archive)
         if 'get_ipython' in globals():
             get_ipython().events.register('post_run_cell',record_cell_failure)
-        files = sorted(p for p in Path(CHECKPOINT_ROOT).rglob('*')
-                       if p.is_file() and p.suffix.lower() in {'.pth','.pt','.ckpt'})
-        print('Checkpoint candidate files (not yet loaded/validated):', len(files))
-        for p in files[:40]: print(f'{p.stat().st_size/2**20:.1f} MiB  {p}')
+        print('Full CUB training: 10 tasks x 30 epochs; no source checkpoints.')
+        print('Save full model checkpoints:', SAVE_CHECKPOINTS)
     '''), cell('code', f'''
         BASE_COMMIT = {BASE!r}
         PATCH_SHA256 = {sha!r}
@@ -163,17 +162,14 @@ def build():
         checked_command([sys.executable,'-m','pytest','-q','tests/test_frequency_state.py',
                          '-p','no:cacheprovider','--junitxml='+str(OUTPUT/'tests.xml')], 'tests')
     '''), cell('code', '''
-        CONFIG = dict(run_mode=RUN_MODE,checkpoint_root=CHECKPOINT_ROOT,checkpoint_map=CHECKPOINT_MAP,
-            trusted_checkpoints=TRUSTED_CHECKPOINTS,data_path=str(READY),output=str(OUTPUT),
+        CONFIG = dict(run_mode=RUN_MODE,save_checkpoints=SAVE_CHECKPOINTS,
+            data_path=str(READY),output=str(OUTPUT),
             npz_path=str(NPZ_PATH),device='cuda:0',num_workers=4)
         CONFIG_PATH = OUTPUT/'notebook_config.json'
         CONFIG_PATH.write_text(json.dumps(CONFIG,indent=2))
-        # Inventory and extraction happen BEFORE expensive evaluation. No images or optimizer step.
+        # Check the fresh output and training plan. No checkpoint discovery or loading.
         checked_command([sys.executable,'tools/frequency_run.py','--config',str(CONFIG_PATH),'--inventory-only'], 'inventory')
-        report=json.loads((OUTPUT/'checkpoint_inventory.json').read_text())
-        for row in report.get('boundaries',[]):
-            print(row['boundary'],row['status'],'epoch=',row.get('epoch'),'path=',row['path'])
-        print('Missing:',report.get('missing_boundaries',[]))
+        print(json.dumps(json.loads((OUTPUT/'training_manifest.json').read_text()),indent=2))
     '''), cell('code', '''
         # Official metadata + split hashes, never a random train/test split.
         checked_command([sys.executable,'-c',
@@ -181,8 +177,8 @@ def build():
             +repr(None if DATA_ROOT is None else str(DATA_ROOT))+","+repr(str(READY))+"),indent=2))"], 'data')
         shutil.copyfile(READY/'official_split_manifest.json',OUTPUT/'official_split_manifest.json')
     '''), cell('code', '''
-        # Full preflight verifies saved args, frozen routing NPZ, strict dynamic load, transforms and GPU.
-        # The runner performs that preflight before evaluating any boundary. No optimizer in reeval.
+        # Preflight verifies the full official split, fresh args, routing NPZ, transforms and GPU.
+        # Train all 10 tasks, collect tiny snapshots and evaluate both branches online.
         # Progress includes boundary/task/images/elapsed/ETA; all stdout is retained in run.log.
         checked_command([sys.executable,'tools/frequency_run.py','--config',str(CONFIG_PATH)], 'evaluation')
     '''), cell('code', '''
@@ -203,6 +199,8 @@ def build():
         from IPython.display import display, FileLink
         print('Metrics ZIP (no model checkpoints):',archive)
         display(FileLink(str(archive)))
+        if SAVE_CHECKPOINTS:
+            print('Model checkpoints (saved in Kaggle output):',OUTPUT/'checkpoint')
     ''')]
     notebook = dict(cells=cells, metadata=dict(kernelspec=dict(display_name='Python 3', language='python', name='python3'),
         language_info=dict(name='python'), kaggle=dict(isGpuEnabled=True, isInternetEnabled=True)), nbformat=4, nbformat_minor=5)
