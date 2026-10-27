@@ -9,13 +9,22 @@ Internet. Add Input `trungkiennguyn/lgsp-dataset` containing official CUB images
 and metadata. **No SEEP checkpoint dataset or upload is needed.**
 For background Save Version, attach the image dataset with
 Add Input first; do not rely on an interactive kagglehub attachment persisting.
-The notebook can discover official CUB metadata or attach the image dataset with
-kagglehub. If the dataset lacks official metadata it stops and requests an
-official CUB-200-2011 Input. It never creates a random split.
+Leave `DATA_ROOT = None` and choose **Run All**. The four code cells get the
+latest code, set up data and dependencies, train, and show results.
+The notebook clones the current HEAD of `feat/task-frequency-state` automatically
+and prints the exact branch/commit used. It creates fresh checkout/output
+directories on each Run All, preserving earlier runs.
+
+CUB discovery searches recursively, including the LGSP layout
+`LGSP/CUB_200_2011/CUB_200_2011`. Even an explicit `DATA_ROOT` may point to an
+outer folder; the setup finds the nested folder with `images/` and all three
+official metadata files. It can attach the image dataset with kagglehub when no
+Input is attached. Missing or ambiguous official metadata produces a clear error;
+the official train/test split and its hashes are still checked.
 
 ## Full training from images (default)
 
-`RUN_MODE = 'train_collect'` is the notebook default. Run all cells to start a
+The notebook always uses `train_collect`. Run all cells to start a
 **new full 10 × 30 epoch run** using all 5,994 official training images across
 200 classes. The 5,794 official test images remain evaluation-only.
 It uses the pinned original training loop and optimizer grouping, with fresh LR
@@ -75,9 +84,12 @@ historical baseline numbers as measurements.
 
 ## Protocol and implementation
 
-Pinned base: `80081081ab42769d102f83d447705da0639e2fb1` from
-<https://github.com/thanhphu25/SEEP>. The notebook embeds a SHA256-verified patch
-and clones this base; it does not require a pushed feature branch. Only the CUB
+Runtime source: the latest `feat/task-frequency-state` commit from
+<https://github.com/thanhphu25/SEEP>. There is no embedded source patch or checkout
+of an old commit in the notebook. `source_manifest.json` records the actual
+remote, branch and commit. The separate delivery patch against original base
+`80081081ab42769d102f83d447705da0639e2fb1` is retained for offline verification.
+Only the CUB
 ImageFolder adapter, lazy video imports and `tools/prepare_cub200.py` were reused
 from the supplied align-only ZIP. Original DGCA patch SHA256:
 `ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e`.
@@ -108,13 +120,14 @@ and GPU are recorded. The original ViT-B/16 NPZ is verified against
 
 ## Outputs and interpretation
 
-Default output: `/kaggle/working/seep_frequency_state_seed3407`.
+Each run creates `/kaggle/working/seep_frequency_state_seed3407_<run-id>/`
+and prints its exact location.
 `SEEP_FREQUENCY_STATE_CUB200_metrics.zip` contains four full-precision CSV
 matrices, summaries, per-task initial/peak/final values, comparison deltas,
 training/bank provenance, route counts, paired output diagnostics, mutation
 checks, source/split/pretrained manifests, environment, configuration, timing,
 logs, tests, patch, README and an output-free notebook. Model checkpoints are
-saved separately in `/kaggle/working/seep_frequency_state_seed3407/checkpoint/`
+saved separately in `OUTPUT/checkpoint/`
 by default. They are retained in the Kaggle notebook output and excluded from
 the metrics ZIP.
 

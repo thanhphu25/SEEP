@@ -1,16 +1,18 @@
 {
-  "validation": "clean pinned checkout + embedded patch + synthetic CPU tests",
+  "validation": "latest-branch notebook + clean offline patch reconstruction + synthetic CPU tests",
   "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
-  "patch_sha256": "81a06957d4d82bf4d594456518aedcf0bb289d5215b15aba17a627ab7621ae9a",
+  "patch_sha256": "848338fe963f4268819f7b8b7725a6dccf82f46435b3fdfec5f8d195fd6a8183",
   "all_source_hashes_match": true,
   "notebook_code_cells_parse": true,
   "notebook_has_no_outputs": true,
-  "notebook_default_run_mode": "train_collect",
+  "notebook_runtime_branch": "feat/task-frequency-state",
+  "notebook_uses_latest_branch_head": true,
+  "notebook_auto_data_discovery": true,
   "notebook_default_save_checkpoints": true,
-  "standalone_notebook_rebuild_byte_exact": true,
+  "notebook_rebuild_byte_exact": true,
   "returncode": 0,
   "test_counts": {
-    "tests": 29,
+    "tests": 34,
     "failures": 0,
     "errors": 0,
     "skipped": 0

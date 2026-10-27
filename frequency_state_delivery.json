@@ -1,7 +1,7 @@
 {
   "base_commit": "80081081ab42769d102f83d447705da0639e2fb1",
   "branch": "feat/task-frequency-state",
-  "patch_sha256": "81a06957d4d82bf4d594456518aedcf0bb289d5215b15aba17a627ab7621ae9a",
+  "patch_sha256": "848338fe963f4268819f7b8b7725a6dccf82f46435b3fdfec5f8d195fd6a8183",
   "source_files_sha256": {
     ".gitattributes": "47047bf270bfe020c8b14cabcc3b10783b00410aadc17c45438d1e27fe89ec1d",
     ".gitignore": "45d987b708eb5f87d889628e5cafa03ef284312b63ca5aa99d06b1708b26422c",
@@ -10,18 +10,21 @@
     "datasets.py": "d9a75e0685cf6f2b95a6af57f4be854c12e647e9e71bafed30a95e06eb43f835",
     "continual_datasets/continual_datasets.py": "89d9ed00a4c273ef131bbdef79ec394fd903e20ed1ce62b1c8c36aecf9b7c8d1",
     "modules/frequency_state.py": "9d49ac3879ec4145ef720c133422cd9135780ab6879aa181ee22b9245a7fa8ef",
-    "tools/frequency_setup.py": "60df75fcdc4716772bd0c2f623dedbe858b8ab599ebcc338c9c199f553df33d4",
+    "tools/frequency_setup.py": "d428273d42f881d76415ffa1f15fd499960b603bd01cd8163f8b3a8fa9aeec71",
     "tools/frequency_run.py": "db131458a63afcacee937d2a912fab6fce169feb50d797e7bfe55adb89f49119",
     "tools/prepare_cub200.py": "5ec826cd800bc9a2038c9dd432c5b589d2f5696c8470a47acbdac5d53bad1ee2",
-    "tools/build_frequency_delivery.py": "7d47d1acfe2a7a8a6ae688f666db299ea1705e1a66073827378026c6ef7ebf7e",
-    "tools/verify_frequency_delivery.py": "1528a275c67ddf38ab995756a3fc43de907ca1b90c6fcc4644b6a839e1c9d263",
-    "tests/test_frequency_state.py": "5f86b4e1f45274f36daf14fff4a01ab48c1a25e5e18860c0953d0c073b4c6a87",
-    "README_FREQUENCY_STATE.md": "c0441a6bb685560e1d573561cbd9dfc76903c036ebb7694bca207835c49fb8d3",
+    "tools/frequency_notebook.py": "6f3d7e1bcfff7ea75a683a3e994f42d3b37cb0d821d2ecb7964bda8aa5e1e295",
+    "tools/build_frequency_delivery.py": "401b3484119bcd83daaf2945b433ca4b8358795f5121d6bfe13840399153f868",
+    "tools/verify_frequency_delivery.py": "67fcc65e53d18ee3c24dd8730312e06f69902c0eb8b02d005b04f45534d7868f",
+    "tests/test_frequency_state.py": "c691b855ee663f7109a18c2bc45fdc840a73075a629cf31c0533d0cd0a5406c5",
+    "README_FREQUENCY_STATE.md": "327943af6b446f3dc60d9e242deb08fd3ac87b6065b57e92d3a45f9241de06e4",
     "references/align_only_seed3407/provenance.json": "ceff45e6a12f3d778ec827858bb5027181ec110edc3672ba65a1f5442247a654",
     "references/align_only_seed3407/official_split_manifest.json": "ccf1a0227ee8f3e72bebb73fce7896b79ea48b784c1a44770a8a5f78cfcd391f",
     "references/align_only_seed3407/source_manifest.json": "8703961a833ed7c1a77a909ef88485aa5dde191b6575efb350160607c182491c"
   },
   "serialization": "LF",
-  "source_mode": "embedded patch; no remote feature branch required",
+  "source_mode": "latest branch HEAD at runtime; offline patch for local verification",
+  "runtime_repo_url": "https://github.com/thanhphu25/SEEP.git",
+  "runtime_branch": "feat/task-frequency-state",
   "reused_dgca_patch_sha256": "ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e"
 }

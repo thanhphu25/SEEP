@@ -1,6 +1,5 @@
-"""Reconstruct the embedded patch on a clean pinned checkout and run CPU tests."""
+"""Verify the latest-branch notebook and reconstruct its optional offline patch."""
 import ast
-import base64
 import hashlib
 import json
 import os
@@ -32,14 +31,17 @@ def verify():
         parsed = ast.parse(''.join(c['source']))
         for node in parsed.body:
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                if node.targets[0].id in ('PATCH_B64', 'PATCH_SHA256', 'BASE_COMMIT', 'DELIVERY',
-                                        'RUN_MODE', 'SAVE_CHECKPOINTS'):
+                if node.targets[0].id in ('SOURCE_URL', 'SOURCE_BRANCH', 'DATA_ROOT', 'SAVE_CHECKPOINTS'):
                     literals[node.targets[0].id] = ast.literal_eval(node.value)
-    assert literals['RUN_MODE'] == 'train_collect'
+    assert literals['SOURCE_URL'] == manifest['runtime_repo_url']
+    assert literals['SOURCE_BRANCH'] == manifest['runtime_branch']
+    assert literals['DATA_ROOT'] is None
     assert literals['SAVE_CHECKPOINTS'] is True
-    patch = base64.b64decode(literals['PATCH_B64'])
-    assert hashlib.sha256(patch).hexdigest() == manifest['patch_sha256'] == literals['PATCH_SHA256']
-    assert patch == (ROOT / 'frequency_state_implementation.patch').read_bytes()
+    code = '\n'.join(''.join(c['source']) for c in nb['cells'] if c['cell_type'] == 'code')
+    assert "'--branch', SOURCE_BRANCH" in code and "'git', 'clone'" in code
+    assert 'PATCH_B64' not in code and 'BASE_COMMIT' not in code and "'checkout'" not in code
+    patch = (ROOT / 'frequency_state_implementation.patch').read_bytes()
+    assert hashlib.sha256(patch).hexdigest() == manifest['patch_sha256']
     parent = ROOT / '.delivery-check'
     parent.mkdir(exist_ok=True)
     checkout = parent / str(uuid.uuid4())
@@ -67,11 +69,12 @@ def verify():
     totals = {key: sum(int(s.attrib.get(key, 0)) for s in suite.iter('testsuite'))
               for key in ('tests', 'failures', 'errors', 'skipped')}
     import torch, torchvision, timm
-    report = dict(validation='clean pinned checkout + embedded patch + synthetic CPU tests',
+    report = dict(validation='latest-branch notebook + clean offline patch reconstruction + synthetic CPU tests',
         base_commit=manifest['base_commit'], patch_sha256=manifest['patch_sha256'],
         all_source_hashes_match=True, notebook_code_cells_parse=True, notebook_has_no_outputs=True,
-        notebook_default_run_mode=literals['RUN_MODE'], notebook_default_save_checkpoints=literals['SAVE_CHECKPOINTS'],
-        standalone_notebook_rebuild_byte_exact=True,
+        notebook_runtime_branch=literals['SOURCE_BRANCH'], notebook_uses_latest_branch_head=True,
+        notebook_auto_data_discovery=True, notebook_default_save_checkpoints=literals['SAVE_CHECKPOINTS'],
+        notebook_rebuild_byte_exact=True,
         returncode=result.returncode, test_counts=totals, checkpoint_files_in_delivery=False,
         full_cub_run=False, actual_environment=dict(python=sys.version, torch=torch.__version__,
             torchvision=torchvision.__version__, timm=timm.__version__, cuda_available=torch.cuda.is_available()),

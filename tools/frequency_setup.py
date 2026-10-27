@@ -52,9 +52,10 @@ def find_official(base):
 
 def prepare_data(source, ready, handle='trungkiennguyn/lgsp-dataset'):
     from tools.prepare_cub200 import prepare
-    if source is None:
-        candidates = find_official('/kaggle/input')
-        if not candidates:
+    search_root = Path(source) if source is not None else Path('/kaggle/input')
+    candidates = find_official(search_root)
+    if not candidates:
+        if source is None:
             import kagglehub
             try:
                 downloaded = kagglehub.dataset_download(handle)
@@ -62,9 +63,14 @@ def prepare_data(source, ready, handle='trungkiennguyn/lgsp-dataset'):
             except Exception as exc:
                 raise RuntimeError('Add Input ' + handle + ' (also for background Save Version). '
                                    'Official images.txt, image_class_labels.txt and train_test_split.txt are required.') from exc
-        if len(candidates) != 1:
-            raise ValueError(f'Found {len(candidates)} official CUB roots. Set DATA_ROOT explicitly; no random split. {candidates}')
-        source = candidates[0]
+        if not candidates:
+            raise FileNotFoundError(f'No official CUB root found inside {search_root}. '
+                'Expected images/ plus images.txt, image_class_labels.txt and train_test_split.txt '
+                'in the same folder. Leave DATA_ROOT=None to search all Kaggle Inputs automatically.')
+    if len(candidates) != 1:
+        raise ValueError(f'Found {len(candidates)} official CUB roots. Set DATA_ROOT to one of: {candidates}')
+    source = candidates[0]
+    print('CUB root:', source, flush=True)
     manifest = prepare(source, ready)
     reference = json.loads((ROOT / 'references/align_only_seed3407/official_split_manifest.json').read_text(encoding='utf8'))
     if manifest['official_metadata_sha256'] != reference['official_metadata_sha256']:

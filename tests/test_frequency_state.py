@@ -372,6 +372,88 @@ def test_timm_shim_idempotent():
     assert once == shim_timm_text(once) and once.count(', field') == 1
 
 
+@pytest.mark.parametrize('scope', ['auto', 'outer', 'exact'])
+def test_prepare_data_finds_nested_cub_root(tmp_path, monkeypatch, scope):
+    import tools.frequency_setup as setup
+    import tools.prepare_cub200 as cub
+    outer = tmp_path / 'LGSP/CUB_200_2011'
+    actual = outer / 'CUB_200_2011'
+    (actual / 'images').mkdir(parents=True)
+    for name in ('images.txt', 'image_class_labels.txt', 'train_test_split.txt'):
+        (actual / name).write_text('metadata fixture')
+    manifest = json.loads((ROOT / 'references/align_only_seed3407/official_split_manifest.json').read_text())
+    calls = []
+    def prepare(source, ready):
+        calls.append((Path(source), Path(ready)))
+        return manifest
+    monkeypatch.setattr(cub, 'prepare', prepare)
+    if scope == 'auto':
+        real_find = setup.find_official
+        monkeypatch.setattr(setup, 'find_official', lambda base: real_find(tmp_path))
+    source = None if scope == 'auto' else outer if scope == 'outer' else actual
+    result = setup.prepare_data(source, tmp_path / 'ready')
+    assert result == manifest and calls == [(actual, tmp_path / 'ready')]
+
+
+def test_prepare_data_rejects_missing_or_ambiguous_official_metadata(tmp_path):
+    from tools.frequency_setup import prepare_data
+    with pytest.raises(FileNotFoundError, match='No official CUB root'):
+        prepare_data(tmp_path, tmp_path / 'ready')
+    for child in ('one', 'two'):
+        root = tmp_path / child
+        (root / 'images').mkdir(parents=True)
+        for name in ('images.txt', 'image_class_labels.txt', 'train_test_split.txt'):
+            (root / name).write_text('metadata fixture')
+    with pytest.raises(ValueError, match='Found 2 official CUB roots'):
+        prepare_data(tmp_path, tmp_path / 'ready')
+
+
+def test_notebook_bootstrap_clones_latest_branch_and_preserves_old_run(tmp_path):
+    """Execute the real generated bootstrap against a local two-branch repository."""
+    import shutil
+    from unittest.mock import patch
+    source = tmp_path / 'remote'; source.mkdir()
+    def git(*args):
+        return subprocess.check_output(['git', '-c', 'user.name=Notebook Test',
+            '-c', 'user.email=notebook-test@example.invalid', *args], cwd=source, text=True).strip()
+    git('init', '-b', 'main')
+    (source / 'README_FREQUENCY_STATE.md').write_text('old main')
+    git('add', '.'); git('commit', '-m', 'old main')
+    git('checkout', '-b', 'feat/task-frequency-state')
+    (source / 'tools').mkdir()
+    for name in ('tools/frequency_notebook.py', 'tools/frequency_setup.py',
+                 '.gitignore', 'README_FREQUENCY_STATE.md', 'SEEP_Frequency_State_CUB200_Kaggle.ipynb'):
+        shutil.copyfile(ROOT / name, source / name)
+    git('add', '.'); git('commit', '-m', 'latest feature')
+    head = git('rev-parse', 'HEAD')
+    work = tmp_path / 'work'; work.mkdir()
+    old = work / 'SEEP_Frequency_State'; old.mkdir()
+    (old / 'user-work.txt').write_text('preserve me')
+    notebook = json.loads((ROOT / 'SEEP_Frequency_State_CUB200_Kaggle.ipynb').read_text(encoding='utf8'))
+    bootstrap = ''.join(notebook['cells'][1]['source'])
+    bootstrap = bootstrap.replace("SOURCE_URL = 'https://github.com/thanhphu25/SEEP.git'", f'SOURCE_URL = {str(source)!r}')
+    bootstrap = bootstrap.replace("Path('/kaggle/working')", f'Path({str(work)!r})')
+    with patch.dict(sys.modules), patch.object(sys, 'path', sys.path.copy()):
+        context = {}
+        exec(compile(bootstrap, '<notebook bootstrap>', 'exec'), context)
+        run = context['run']
+    manifest = json.loads((run.output / 'source_manifest.json').read_text(encoding='utf8'))
+    assert manifest['commit'] == head and manifest['branch'] == 'feat/task-frequency-state'
+    assert run.config['source'] is None and run.config['save_checkpoints']
+    assert run.repo != old and (old / 'user-work.txt').read_text() == 'preserve me'
+    assert subprocess.check_output(['git', 'status', '--porcelain'], cwd=run.repo, text=True) == ''
+    with pytest.raises(RuntimeError, match='setup cell successfully'):
+        run.train()
+    (run.output / 'summary.json').write_text(json.dumps(dict(full_protocol_complete=True, process_success=True)))
+    with pytest.raises(subprocess.CalledProcessError):
+        run._command([sys.executable, '-c', "print('setup failure detail'); raise SystemExit(7)"], 'setup')
+    assert 'setup failure detail' in (run.output / 'run.log').read_text()
+    assert json.loads((run.output / 'setup_result.json').read_text())['returncode'] == 7
+    assert not json.loads((run.output / 'summary.json').read_text())['full_protocol_complete']
+    with pytest.raises(RuntimeError, match='setup cell successfully'):
+        run.train()
+
+
 def test_actual_runner_reeval_orchestrates_ten_boundaries_without_optimizer(tmp_path, monkeypatch):
     """Synthetic integration of actual runner, paired loop, strict load and exports.
 

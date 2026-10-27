@@ -608,7 +608,7 @@ diff --git a/tools/frequency_setup.py b/tools/frequency_setup.py
 new file mode 100644
 --- /dev/null
 +++ b/tools/frequency_setup.py
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,107 @@
 +"""Kaggle setup utilities. Reuses only the verified DGCA CUB adapter/preparation.
 +
 +No torch/torchvision installation and no representation enhancement modules.
@@ -663,9 +663,10 @@ new file mode 100644
 +
 +def prepare_data(source, ready, handle='trungkiennguyn/lgsp-dataset'):
 +    from tools.prepare_cub200 import prepare
-+    if source is None:
-+        candidates = find_official('/kaggle/input')
-+        if not candidates:
++    search_root = Path(source) if source is not None else Path('/kaggle/input')
++    candidates = find_official(search_root)
++    if not candidates:
++        if source is None:
 +            import kagglehub
 +            try:
 +                downloaded = kagglehub.dataset_download(handle)
@@ -673,9 +674,14 @@ new file mode 100644
 +            except Exception as exc:
 +                raise RuntimeError('Add Input ' + handle + ' (also for background Save Version). '
 +                                   'Official images.txt, image_class_labels.txt and train_test_split.txt are required.') from exc
-+        if len(candidates) != 1:
-+            raise ValueError(f'Found {len(candidates)} official CUB roots. Set DATA_ROOT explicitly; no random split. {candidates}')
-+        source = candidates[0]
++        if not candidates:
++            raise FileNotFoundError(f'No official CUB root found inside {search_root}. '
++                'Expected images/ plus images.txt, image_class_labels.txt and train_test_split.txt '
++                'in the same folder. Leave DATA_ROOT=None to search all Kaggle Inputs automatically.')
++    if len(candidates) != 1:
++        raise ValueError(f'Found {len(candidates)} official CUB roots. Set DATA_ROOT to one of: {candidates}')
++    source = candidates[0]
++    print('CUB root:', source, flush=True)
 +    manifest = prepare(source, ready)
 +    reference = json.loads((ROOT / 'references/align_only_seed3407/official_split_manifest.json').read_text(encoding='utf8'))
 +    if manifest['official_metadata_sha256'] != reference['official_metadata_sha256']:
@@ -1188,13 +1194,145 @@ new file mode 100644
 +    parser.add_argument('--output', type=Path, required=True)
 +    args = parser.parse_args()
 +    print(json.dumps(prepare(args.source, args.output), indent=2))
+diff --git a/tools/frequency_notebook.py b/tools/frequency_notebook.py
+new file mode 100644
+--- /dev/null
++++ b/tools/frequency_notebook.py
+@@ -0,0 +1,128 @@
++"""Small Kaggle notebook interface; all training runs in fresh Python processes."""
++import argparse
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++from tools.frequency_setup import export
++
++
++class KaggleRun:
++    def __init__(self, repo, data_root=None, save_checkpoints=True, work='/kaggle/working'):
++        self.repo, work = Path(repo), Path(work)
++        self.output = Path(tempfile.mkdtemp(prefix='seep_frequency_state_seed3407_', dir=work))
++        self.config_path = self.output / 'notebook_config.json'
++        self.config = dict(run_mode='train_collect', save_checkpoints=save_checkpoints,
++            source=None if data_root is None else str(data_root),
++            data_path=str(work / (self.output.name + '_data')), output=str(self.output),
++            npz_path=str(work / 'pretrained/ViT-B_16.npz'), device='cuda:0', num_workers=4)
++        self.config_path.write_text(json.dumps(self.config, indent=2), encoding='utf8')
++        commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.repo, text=True).strip()
++        branch = subprocess.check_output(['git', 'branch', '--show-current'], cwd=self.repo, text=True).strip()
++        source = dict(source_mode='latest branch HEAD at notebook startup', branch=branch, commit=commit,
++            remote=subprocess.check_output(['git', 'remote', 'get-url', 'origin'], cwd=self.repo, text=True).strip())
++        (self.output / 'source_manifest.json').write_text(json.dumps(source, indent=2), encoding='utf8')
++        for name in ('README_FREQUENCY_STATE.md', 'SEEP_Frequency_State_CUB200_Kaggle.ipynb'):
++            shutil.copyfile(self.repo / name, self.output / name)
++        print('Source:', branch, commit)
++        print('Output:', self.output)
++
++    def _command(self, command, phase):
++        tick = time.perf_counter()
++        with (self.output / 'run.log').open('a', encoding='utf8') as log:
++            log.write('\nPHASE ' + phase + '\n')
++            log.flush()
++            process = subprocess.Popen(command, cwd=self.repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                text=True, encoding='utf8', errors='replace',
++                env={**os.environ, 'PYTHONUNBUFFERED': '1', 'PYTHONIOENCODING': 'utf8'})
++            try:
++                for line in process.stdout:
++                    print(line, end='')
++                    log.write(line)
++                    log.flush()
++                code = process.wait()
++            except BaseException:
++                process.terminate()
++                try:
++                    process.wait(timeout=10)
++                except subprocess.TimeoutExpired:
++                    process.kill()
++                    process.wait()
++                self._failed(phase, 'Command interrupted')
++                raise
++        (self.output / (phase + '_result.json')).write_text(json.dumps(
++            dict(returncode=code, seconds=time.perf_counter() - tick)), encoding='utf8')
++        if code:
++            self._failed(phase, f'Command exited with code {code}')
++            raise subprocess.CalledProcessError(code, command)
++
++    def _failed(self, phase, error):
++        (self.output / 'run_status.json').write_text(json.dumps(
++            dict(status='failed', phase=phase, error=error, full_protocol_complete=False)), encoding='utf8')
++        summary = self.output / 'summary.json'
++        if summary.exists():
++            value = json.loads(summary.read_text(encoding='utf8'))
++            value.update(full_protocol_complete=False, process_success=False)
++            summary.write_text(json.dumps(value, indent=2), encoding='utf8')
++        print('Partial output:', export(self.output))
++
++    def setup(self):
++        self._command([sys.executable, 'tools/frequency_notebook.py', '--setup',
++                       '--config', str(self.config_path)], 'setup')
++
++    def train(self):
++        setup = self.output / 'setup_result.json'
++        if not setup.exists() or json.loads(setup.read_text(encoding='utf8'))['returncode'] != 0:
++            raise RuntimeError('Run the setup cell successfully before training.')
++        self._command([sys.executable, 'tools/frequency_run.py', '--config', str(self.config_path)], 'evaluation')
++
++    def results(self):
++        status = json.loads((self.output / 'run_status.json').read_text(encoding='utf8'))
++        result = json.loads((self.output / 'evaluation_result.json').read_text(encoding='utf8'))
++        summary = json.loads((self.output / 'summary.json').read_text(encoding='utf8'))
++        if status['status'] != 'complete' or result['returncode'] != 0 or not summary['full_protocol_complete']:
++            raise RuntimeError('Training is incomplete; inspect run.log in ' + str(self.output))
++        print(json.dumps(summary['snapshot_minus_live_percentage_points']['raw_exact'], indent=2))
++        if self.config['save_checkpoints']:
++            print('Checkpoints:', self.output / 'checkpoint')
++        archive = export(self.output)
++        print('Metrics ZIP:', archive)
++        return archive
++
++
++def setup(config):
++    import torch
++    from tools.frequency_setup import dependencies, prepare_data
++    output = Path(config['output'])
++    if not torch.cuda.is_available():
++        raise RuntimeError('Enable a GPU accelerator in Kaggle Settings, then rerun this cell.')
++    print('GPU:', torch.cuda.get_device_name(), flush=True)
++    dependencies(output)
++    manifest = prepare_data(config.get('source'), config['data_path'])
++    shutil.copyfile(Path(config['data_path']) / 'official_split_manifest.json', output / 'official_split_manifest.json')
++    print(f"CUB ready: {manifest['train']} train / {manifest['test']} test / {manifest['classes']} classes", flush=True)
++    # Use the checked-out source and preserve the real test exit code.
++    command = [sys.executable, '-m', 'pytest', '-q', 'tests/test_frequency_state.py',
++               '-p', 'no:cacheprovider', '--junitxml=' + str(output / 'tests.xml')]
++    code = subprocess.call(command, cwd=ROOT, env={**os.environ, 'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1'})
++    (output / 'tests_result.json').write_text(json.dumps(dict(returncode=code)), encoding='utf8')
++    if code:
++        raise subprocess.CalledProcessError(code, command)
++    print('Setup passed. Run the training cell.', flush=True)
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(__doc__)
++    parser.add_argument('--setup', action='store_true', required=True)
++    parser.add_argument('--config', type=Path, required=True)
++    cli = parser.parse_args()
++    setup(json.loads(cli.config.read_text(encoding='utf8')))
 diff --git a/tools/build_frequency_delivery.py b/tools/build_frequency_delivery.py
 new file mode 100644
 --- /dev/null
 +++ b/tools/build_frequency_delivery.py
-@@ -0,0 +1,223 @@
-+"""Build a standalone Kaggle notebook from LF source files against the pinned base."""
-+import base64
+@@ -0,0 +1,110 @@
++"""Build a small latest-branch Kaggle notebook and an optional offline source patch."""
 +import difflib
 +import hashlib
 +import json
@@ -1208,6 +1346,7 @@ new file mode 100644
 +SOURCES = ['.gitattributes', '.gitignore', 'vision_transformer.py', 'engine.py', 'datasets.py',
 +    'continual_datasets/continual_datasets.py', 'modules/frequency_state.py',
 +    'tools/frequency_setup.py', 'tools/frequency_run.py', 'tools/prepare_cub200.py',
++    'tools/frequency_notebook.py',
 +    'tools/build_frequency_delivery.py', 'tools/verify_frequency_delivery.py',
 +    'tests/test_frequency_state.py', 'README_FREQUENCY_STATE.md',
 +    'references/align_only_seed3407/provenance.json',
@@ -1243,160 +1382,47 @@ new file mode 100644
 +    patch = patch.encode()
 +    sha = hashlib.sha256(patch).hexdigest()
 +    manifest = dict(base_commit=BASE, branch='feat/task-frequency-state', patch_sha256=sha,
-+                    source_files_sha256=hashes, serialization='LF', source_mode='embedded patch; no remote feature branch required',
++                    source_files_sha256=hashes, serialization='LF', source_mode='latest branch HEAD at runtime; offline patch for local verification',
++                    runtime_repo_url='https://github.com/thanhphu25/SEEP.git', runtime_branch='feat/task-frequency-state',
 +                    reused_dgca_patch_sha256='ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e')
-+    payload = base64.b64encode(patch).decode()
-+    cells = [cell('markdown', '''
-+        # SEEP frequency-state recall — CUB200, seed 3407
++    cells = [cell('markdown', """
++        # SEEP CUB200 — Run All
 +
-+        Enable **GPU + Internet**. Add Input `trungkiennguyn/lgsp-dataset`
-+        (official CUB-200-2011 images and metadata). Attach it before background Save Version.
-+        Run all cells to train on the full official train split: **5,994 images,
-+        10 tasks × 30 epochs**, with paired live/snapshot evaluation after each task.
-+        **No checkpoint dataset or upload is needed.** Full model + optimizer
-+        checkpoints are saved after each task in the Kaggle output, alongside
-+        the frequency bank, metrics and logs.
-+        No CLS Steering / N1 / CCSR / Gaussian alignment / transport is used.
-+        Local validation is synthetic; this notebook has no precomputed CUB result.
-+    '''), cell('code', '''
-+        import sys, os, json, hashlib, base64, subprocess, shutil, time, traceback
++        1. Bật **GPU + Internet** trong Kaggle Settings.
++        2. **Add Input** bộ `trungkiennguyn/lgsp-dataset` (CUB200).
++        3. Chọn **Run All**. Không cần sửa đường dẫn hay gắn checkpoint đầu vào.
++
++        Notebook tự clone commit mới nhất của nhánh `feat/task-frequency-state`,
++        tìm thư mục CUB kể cả khi lồng nhiều cấp, train **10 task × 30 epoch**
++        và lưu checkpoint từng task trong output. Mỗi lần Run All tạo thư mục
++        mới, giữ lại các kết quả cũ. GPU full training chưa được chạy sẵn.
++    """), cell('code', """
++        # 1. Lấy code mới nhất đúng nhánh; không checkout commit cũ hay apply patch.
++        import subprocess, sys, tempfile
 +        from pathlib import Path
-+        RUN_MODE = 'train_collect'  # NEW full 10 x 30 run from images; no SEEP checkpoint input.
-+        SAVE_CHECKPOINTS = True  # Save each task's model + optimizer in OUTPUT/checkpoint (separate from metrics ZIP).
-+        DATA_ROOT = None  # Set official CUB root here if discovery finds duplicates.
-+        REPO = Path('/kaggle/working/SEEP_Frequency_State')
-+        READY = Path('/kaggle/working/cub200_ready_frequency_state')
-+        OUTPUT = Path('/kaggle/working/seep_frequency_state_seed3407')
-+        NPZ_PATH = Path('/kaggle/working/pretrained/ViT-B_16.npz')
-+        assert RUN_MODE == 'train_collect', 'This notebook trains from images. See README for explicit checkpoint reeval.'
-+        assert not OUTPUT.exists(), 'Use a fresh OUTPUT directory to preserve previous results.'
-+        OUTPUT.mkdir(parents=True)
-+        (OUTPUT/'run_status.json').write_text(json.dumps({'status':'configured','full_protocol_complete':False}))
-+        NOTEBOOK_STARTED = time.perf_counter()
-+        def record_cell_failure(result):
-+            error = result.error_before_exec or result.error_in_exec
-+            if error is None: return
-+            (OUTPUT/'run_status.json').write_text(json.dumps({'status':'failed','error':str(error),'full_protocol_complete':False}))
-+            (OUTPUT/'timing.json').write_text(json.dumps({'notebook_elapsed_seconds':time.perf_counter()-NOTEBOOK_STARTED}))
-+            with (OUTPUT/'run.log').open('a',encoding='utf8') as stream:
-+                traceback.print_exception(type(error),error,error.__traceback__,file=stream)
-+            summary_path = OUTPUT/'summary.json'
-+            if summary_path.exists():
-+                summary=json.loads(summary_path.read_text()); summary['full_protocol_complete']=False
-+                summary['process_success']=False; summary_path.write_text(json.dumps(summary,indent=2))
-+            # Works even when clone/dependency setup fails before project imports.
-+            import zipfile
-+            archive=OUTPUT.parent/'SEEP_FREQUENCY_STATE_CUB200_metrics.zip'
-+            with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as bundle:
-+                for path in sorted(OUTPUT.rglob('*')):
-+                    if path.is_file() and path.suffix.lower() in {'.json','.csv','.txt','.log','.patch','.md','.ipynb','.xml'}:
-+                        bundle.write(path,str(path.relative_to(OUTPUT)))
-+            print('Failed/partial archive:',archive)
-+        if 'get_ipython' in globals():
-+            get_ipython().events.register('post_run_cell',record_cell_failure)
-+        print('Full CUB training: 10 tasks x 30 epochs; no source checkpoints.')
-+        print('Save full model checkpoints:', SAVE_CHECKPOINTS)
-+    '''), cell('code', f'''
-+        BASE_COMMIT = {BASE!r}
-+        PATCH_SHA256 = {sha!r}
-+        PATCH_B64 = {payload!r}
-+        DELIVERY = {manifest!r}
-+        assert not REPO.exists(), 'Use a new REPO directory; existing work is preserved.'
-+        subprocess.check_call(['git','clone','https://github.com/thanhphu25/SEEP.git',str(REPO)])
-+        subprocess.check_call(['git','config','core.autocrlf','false'], cwd=REPO)
-+        subprocess.check_call(['git','checkout','--detach',BASE_COMMIT], cwd=REPO)
-+        patch = base64.b64decode(PATCH_B64)
-+        assert hashlib.sha256(patch).hexdigest() == PATCH_SHA256
-+        patch_path = REPO/'implementation.patch'
-+        patch_path.write_bytes(patch)
-+        subprocess.check_call(['git','apply','--check',str(patch_path)], cwd=REPO)
-+        subprocess.check_call(['git','apply',str(patch_path)], cwd=REPO)
-+        for name, expected in DELIVERY['source_files_sha256'].items():
-+            assert hashlib.sha256((REPO/name).read_bytes()).hexdigest() == expected, name
-+        (OUTPUT/'source_manifest.json').write_text(json.dumps(DELIVERY,indent=2))
-+        shutil.copyfile(patch_path, OUTPUT/'implementation.patch')
-+        shutil.copyfile(REPO/'README_FREQUENCY_STATE.md',OUTPUT/'README.md')
-+        sys.path.insert(0,str(REPO))
-+        from tools.frequency_setup import export
-+        def checked_command(command, phase):
-+            tick = time.perf_counter()
-+            with (OUTPUT/'run.log').open('a',encoding='utf8') as log:
-+                log.write('\\nPHASE '+phase+'\\n'); log.flush()
-+                process = subprocess.Popen(command,cwd=REPO,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
-+                    text=True,encoding='utf8',errors='replace',env={{**os.environ,'PYTHONUNBUFFERED':'1','PYTHONIOENCODING':'utf8'}})
-+                try:
-+                    for line in process.stdout: print(line,end=''); log.write(line); log.flush()
-+                    result = process.wait()
-+                except BaseException:
-+                    process.terminate()
-+                    try: process.wait(timeout=10)
-+                    except subprocess.TimeoutExpired: process.kill(); process.wait()
-+                    raise
-+            (OUTPUT/(phase+'_result.json')).write_text(json.dumps({{'returncode':result,'seconds':time.perf_counter()-tick}}))
-+            if result != 0:
-+                (OUTPUT/'run_status.json').write_text(json.dumps({{'status':'failed','phase':phase,'returncode':result,'full_protocol_complete':False}}))
-+                summary_path = OUTPUT/'summary.json'
-+                if summary_path.exists():
-+                    summary=json.loads(summary_path.read_text()); summary['full_protocol_complete']=False
-+                    summary_path.write_text(json.dumps(summary,indent=2))
-+                print('Partial/failure archive:',export(OUTPUT))
-+                raise subprocess.CalledProcessError(result,command)
-+        print('Pinned source and patch verified:',PATCH_SHA256)
-+        checked_command([sys.executable,'tools/build_frequency_delivery.py'],'notebook_export')
-+        shutil.copyfile(REPO/'SEEP_Frequency_State_CUB200_Kaggle.ipynb',OUTPUT/'SEEP_Frequency_State_CUB200_Kaggle.ipynb')
-+    ''', tags=['embedded-source'], jupyter={'source_hidden': True}, collapsed=True), cell('code', '''
-+        # Keep installed torch/torchvision; timm shim is idempotent on Python 3.13.
-+        checked_command([sys.executable,'-c',
-+            "from tools.frequency_setup import dependencies; dependencies("+repr(str(OUTPUT))+")"], 'dependencies')
-+        import torch, torchvision
-+        print('Actual stack:',sys.version,torch.__version__,torchvision.__version__)
-+        assert torch.cuda.is_available(), 'Enable GPU in Kaggle settings.'
-+        print('GPU:',torch.cuda.get_device_name())
-+    '''), cell('code', '''
-+        # Tests use synthetic CPU tensors; no scientific accuracy claim.
-+        checked_command([sys.executable,'-m','pytest','-q','tests/test_frequency_state.py',
-+                         '-p','no:cacheprovider','--junitxml='+str(OUTPUT/'tests.xml')], 'tests')
-+    '''), cell('code', '''
-+        CONFIG = dict(run_mode=RUN_MODE,save_checkpoints=SAVE_CHECKPOINTS,
-+            data_path=str(READY),output=str(OUTPUT),
-+            npz_path=str(NPZ_PATH),device='cuda:0',num_workers=4)
-+        CONFIG_PATH = OUTPUT/'notebook_config.json'
-+        CONFIG_PATH.write_text(json.dumps(CONFIG,indent=2))
-+        # Check the fresh output and training plan. No checkpoint discovery or loading.
-+        checked_command([sys.executable,'tools/frequency_run.py','--config',str(CONFIG_PATH),'--inventory-only'], 'inventory')
-+        print(json.dumps(json.loads((OUTPUT/'training_manifest.json').read_text()),indent=2))
-+    '''), cell('code', '''
-+        # Official metadata + split hashes, never a random train/test split.
-+        checked_command([sys.executable,'-c',
-+            "from tools.frequency_setup import prepare_data; import json; print(json.dumps(prepare_data("
-+            +repr(None if DATA_ROOT is None else str(DATA_ROOT))+","+repr(str(READY))+"),indent=2))"], 'data')
-+        shutil.copyfile(READY/'official_split_manifest.json',OUTPUT/'official_split_manifest.json')
-+    '''), cell('code', '''
-+        # Preflight verifies the full official split, fresh args, routing NPZ, transforms and GPU.
-+        # Train all 10 tasks, collect tiny snapshots and evaluate both branches online.
-+        # Progress includes boundary/task/images/elapsed/ETA; all stdout is retained in run.log.
-+        checked_command([sys.executable,'tools/frequency_run.py','--config',str(CONFIG_PATH)], 'evaluation')
-+    '''), cell('code', '''
-+        # Recompute from exported CSV matrices and require successful process exit.
-+        import numpy as np
-+        from modules.frequency_state import CHANNELS
-+        from tools.frequency_run import write_metrics
-+        status=json.loads((OUTPUT/'run_status.json').read_text())
-+        result=json.loads((OUTPUT/'evaluation_result.json').read_text())
-+        matrices={k:np.loadtxt(OUTPUT/f'task_accuracy_matrix_{k}.csv',delimiter=',') for k in CHANNELS}
-+        checks=json.loads((OUTPUT/'mutation_checks.json').read_text())
-+        summary=write_metrics(OUTPUT,matrices,process_success=result['returncode']==0,
-+            checks_pass=len(checks)==10 and all(c['passed'] for c in checks))
-+        assert status['status']=='complete' and summary['full_protocol_complete']
-+        archive=export(OUTPUT)
-+        print(json.dumps({'primary_delta_pp':summary['snapshot_minus_live_percentage_points']['raw_exact'],
-+                          'screening_signal':summary['screening_signal'],'full_protocol_complete':True},indent=2))
++        SOURCE_URL = 'https://github.com/thanhphu25/SEEP.git'
++        SOURCE_BRANCH = 'feat/task-frequency-state'
++        DATA_ROOT = None  # Tự tìm CUB trong Kaggle Inputs, kể cả CUB_200_2011/CUB_200_2011.
++        SAVE_CHECKPOINTS = True
++        WORK = Path('/kaggle/working')
++        REPO = Path(tempfile.mkdtemp(prefix='SEEP_Frequency_State_', dir=WORK))
++        subprocess.check_call(['git', 'clone', '--single-branch', '--branch', SOURCE_BRANCH, SOURCE_URL, str(REPO)])
++        sys.path.insert(0, str(REPO))
++        for name in ('tools.frequency_notebook', 'tools.frequency_setup'):
++            sys.modules.pop(name, None)
++        from tools.frequency_notebook import KaggleRun
++        run = KaggleRun(REPO, data_root=DATA_ROOT, save_checkpoints=SAVE_CHECKPOINTS, work=WORK)
++    """), cell('code', """
++        # 2. Cài phụ thuộc, tự tìm dữ liệu và kiểm thử. Có thể chạy lại cell này nếu setup lỗi.
++        run.setup()
++    """), cell('code', """
++        # 3. Train đầy đủ 10 × 30 epoch; lưu checkpoint và đánh giá sau từng task.
++        run.train()
++    """), cell('code', """
++        # 4. Kết quả và link tải metrics. Checkpoint nằm riêng trong output/checkpoint/.
 +        from IPython.display import display, FileLink
-+        print('Metrics ZIP (no model checkpoints):',archive)
-+        display(FileLink(str(archive)))
-+        if SAVE_CHECKPOINTS:
-+            print('Model checkpoints (saved in Kaggle output):',OUTPUT/'checkpoint')
-+    ''')]
++        display(FileLink(str(run.results())))
++    """)]
 +    notebook = dict(cells=cells, metadata=dict(kernelspec=dict(display_name='Python 3', language='python', name='python3'),
 +        language_info=dict(name='python'), kaggle=dict(isGpuEnabled=True, isInternetEnabled=True)), nbformat=4, nbformat_minor=5)
 +    import ast
@@ -1420,10 +1446,9 @@ diff --git a/tools/verify_frequency_delivery.py b/tools/verify_frequency_deliver
 new file mode 100644
 --- /dev/null
 +++ b/tools/verify_frequency_delivery.py
-@@ -0,0 +1,95 @@
-+"""Reconstruct the embedded patch on a clean pinned checkout and run CPU tests."""
+@@ -0,0 +1,98 @@
++"""Verify the latest-branch notebook and reconstruct its optional offline patch."""
 +import ast
-+import base64
 +import hashlib
 +import json
 +import os
@@ -1455,14 +1480,17 @@ new file mode 100644
 +        parsed = ast.parse(''.join(c['source']))
 +        for node in parsed.body:
 +            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-+                if node.targets[0].id in ('PATCH_B64', 'PATCH_SHA256', 'BASE_COMMIT', 'DELIVERY',
-+                                        'RUN_MODE', 'SAVE_CHECKPOINTS'):
++                if node.targets[0].id in ('SOURCE_URL', 'SOURCE_BRANCH', 'DATA_ROOT', 'SAVE_CHECKPOINTS'):
 +                    literals[node.targets[0].id] = ast.literal_eval(node.value)
-+    assert literals['RUN_MODE'] == 'train_collect'
++    assert literals['SOURCE_URL'] == manifest['runtime_repo_url']
++    assert literals['SOURCE_BRANCH'] == manifest['runtime_branch']
++    assert literals['DATA_ROOT'] is None
 +    assert literals['SAVE_CHECKPOINTS'] is True
-+    patch = base64.b64decode(literals['PATCH_B64'])
-+    assert hashlib.sha256(patch).hexdigest() == manifest['patch_sha256'] == literals['PATCH_SHA256']
-+    assert patch == (ROOT / 'frequency_state_implementation.patch').read_bytes()
++    code = '\n'.join(''.join(c['source']) for c in nb['cells'] if c['cell_type'] == 'code')
++    assert "'--branch', SOURCE_BRANCH" in code and "'git', 'clone'" in code
++    assert 'PATCH_B64' not in code and 'BASE_COMMIT' not in code and "'checkout'" not in code
++    patch = (ROOT / 'frequency_state_implementation.patch').read_bytes()
++    assert hashlib.sha256(patch).hexdigest() == manifest['patch_sha256']
 +    parent = ROOT / '.delivery-check'
 +    parent.mkdir(exist_ok=True)
 +    checkout = parent / str(uuid.uuid4())
@@ -1490,11 +1518,12 @@ new file mode 100644
 +    totals = {key: sum(int(s.attrib.get(key, 0)) for s in suite.iter('testsuite'))
 +              for key in ('tests', 'failures', 'errors', 'skipped')}
 +    import torch, torchvision, timm
-+    report = dict(validation='clean pinned checkout + embedded patch + synthetic CPU tests',
++    report = dict(validation='latest-branch notebook + clean offline patch reconstruction + synthetic CPU tests',
 +        base_commit=manifest['base_commit'], patch_sha256=manifest['patch_sha256'],
 +        all_source_hashes_match=True, notebook_code_cells_parse=True, notebook_has_no_outputs=True,
-+        notebook_default_run_mode=literals['RUN_MODE'], notebook_default_save_checkpoints=literals['SAVE_CHECKPOINTS'],
-+        standalone_notebook_rebuild_byte_exact=True,
++        notebook_runtime_branch=literals['SOURCE_BRANCH'], notebook_uses_latest_branch_head=True,
++        notebook_auto_data_discovery=True, notebook_default_save_checkpoints=literals['SAVE_CHECKPOINTS'],
++        notebook_rebuild_byte_exact=True,
 +        returncode=result.returncode, test_counts=totals, checkpoint_files_in_delivery=False,
 +        full_cub_run=False, actual_environment=dict(python=sys.version, torch=torch.__version__,
 +            torchvision=torchvision.__version__, timm=timm.__version__, cuda_available=torch.cuda.is_available()),
@@ -1520,7 +1549,7 @@ diff --git a/tests/test_frequency_state.py b/tests/test_frequency_state.py
 new file mode 100644
 --- /dev/null
 +++ b/tests/test_frequency_state.py
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,667 @@
 +import copy
 +import json
 +import subprocess
@@ -1895,6 +1924,88 @@ new file mode 100644
 +    assert once == shim_timm_text(once) and once.count(', field') == 1
 +
 +
++@pytest.mark.parametrize('scope', ['auto', 'outer', 'exact'])
++def test_prepare_data_finds_nested_cub_root(tmp_path, monkeypatch, scope):
++    import tools.frequency_setup as setup
++    import tools.prepare_cub200 as cub
++    outer = tmp_path / 'LGSP/CUB_200_2011'
++    actual = outer / 'CUB_200_2011'
++    (actual / 'images').mkdir(parents=True)
++    for name in ('images.txt', 'image_class_labels.txt', 'train_test_split.txt'):
++        (actual / name).write_text('metadata fixture')
++    manifest = json.loads((ROOT / 'references/align_only_seed3407/official_split_manifest.json').read_text())
++    calls = []
++    def prepare(source, ready):
++        calls.append((Path(source), Path(ready)))
++        return manifest
++    monkeypatch.setattr(cub, 'prepare', prepare)
++    if scope == 'auto':
++        real_find = setup.find_official
++        monkeypatch.setattr(setup, 'find_official', lambda base: real_find(tmp_path))
++    source = None if scope == 'auto' else outer if scope == 'outer' else actual
++    result = setup.prepare_data(source, tmp_path / 'ready')
++    assert result == manifest and calls == [(actual, tmp_path / 'ready')]
++
++
++def test_prepare_data_rejects_missing_or_ambiguous_official_metadata(tmp_path):
++    from tools.frequency_setup import prepare_data
++    with pytest.raises(FileNotFoundError, match='No official CUB root'):
++        prepare_data(tmp_path, tmp_path / 'ready')
++    for child in ('one', 'two'):
++        root = tmp_path / child
++        (root / 'images').mkdir(parents=True)
++        for name in ('images.txt', 'image_class_labels.txt', 'train_test_split.txt'):
++            (root / name).write_text('metadata fixture')
++    with pytest.raises(ValueError, match='Found 2 official CUB roots'):
++        prepare_data(tmp_path, tmp_path / 'ready')
++
++
++def test_notebook_bootstrap_clones_latest_branch_and_preserves_old_run(tmp_path):
++    """Execute the real generated bootstrap against a local two-branch repository."""
++    import shutil
++    from unittest.mock import patch
++    source = tmp_path / 'remote'; source.mkdir()
++    def git(*args):
++        return subprocess.check_output(['git', '-c', 'user.name=Notebook Test',
++            '-c', 'user.email=notebook-test@example.invalid', *args], cwd=source, text=True).strip()
++    git('init', '-b', 'main')
++    (source / 'README_FREQUENCY_STATE.md').write_text('old main')
++    git('add', '.'); git('commit', '-m', 'old main')
++    git('checkout', '-b', 'feat/task-frequency-state')
++    (source / 'tools').mkdir()
++    for name in ('tools/frequency_notebook.py', 'tools/frequency_setup.py',
++                 '.gitignore', 'README_FREQUENCY_STATE.md', 'SEEP_Frequency_State_CUB200_Kaggle.ipynb'):
++        shutil.copyfile(ROOT / name, source / name)
++    git('add', '.'); git('commit', '-m', 'latest feature')
++    head = git('rev-parse', 'HEAD')
++    work = tmp_path / 'work'; work.mkdir()
++    old = work / 'SEEP_Frequency_State'; old.mkdir()
++    (old / 'user-work.txt').write_text('preserve me')
++    notebook = json.loads((ROOT / 'SEEP_Frequency_State_CUB200_Kaggle.ipynb').read_text(encoding='utf8'))
++    bootstrap = ''.join(notebook['cells'][1]['source'])
++    bootstrap = bootstrap.replace("SOURCE_URL = 'https://github.com/thanhphu25/SEEP.git'", f'SOURCE_URL = {str(source)!r}')
++    bootstrap = bootstrap.replace("Path('/kaggle/working')", f'Path({str(work)!r})')
++    with patch.dict(sys.modules), patch.object(sys, 'path', sys.path.copy()):
++        context = {}
++        exec(compile(bootstrap, '<notebook bootstrap>', 'exec'), context)
++        run = context['run']
++    manifest = json.loads((run.output / 'source_manifest.json').read_text(encoding='utf8'))
++    assert manifest['commit'] == head and manifest['branch'] == 'feat/task-frequency-state'
++    assert run.config['source'] is None and run.config['save_checkpoints']
++    assert run.repo != old and (old / 'user-work.txt').read_text() == 'preserve me'
++    assert subprocess.check_output(['git', 'status', '--porcelain'], cwd=run.repo, text=True) == ''
++    with pytest.raises(RuntimeError, match='setup cell successfully'):
++        run.train()
++    (run.output / 'summary.json').write_text(json.dumps(dict(full_protocol_complete=True, process_success=True)))
++    with pytest.raises(subprocess.CalledProcessError):
++        run._command([sys.executable, '-c', "print('setup failure detail'); raise SystemExit(7)"], 'setup')
++    assert 'setup failure detail' in (run.output / 'run.log').read_text()
++    assert json.loads((run.output / 'setup_result.json').read_text())['returncode'] == 7
++    assert not json.loads((run.output / 'summary.json').read_text())['full_protocol_complete']
++    with pytest.raises(RuntimeError, match='setup cell successfully'):
++        run.train()
++
++
 +def test_actual_runner_reeval_orchestrates_ten_boundaries_without_optimizer(tmp_path, monkeypatch):
 +    """Synthetic integration of actual runner, paired loop, strict load and exports.
 +
@@ -2110,7 +2221,7 @@ diff --git a/README_FREQUENCY_STATE.md b/README_FREQUENCY_STATE.md
 new file mode 100644
 --- /dev/null
 +++ b/README_FREQUENCY_STATE.md
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,159 @@
 +# SEEP task frequency-state recall — CUB200 / seed 3407
 +
 +This implementation tests one mechanism: recall the frequency state belonging to
@@ -2122,13 +2233,22 @@ new file mode 100644
 +and metadata. **No SEEP checkpoint dataset or upload is needed.**
 +For background Save Version, attach the image dataset with
 +Add Input first; do not rely on an interactive kagglehub attachment persisting.
-+The notebook can discover official CUB metadata or attach the image dataset with
-+kagglehub. If the dataset lacks official metadata it stops and requests an
-+official CUB-200-2011 Input. It never creates a random split.
++Leave `DATA_ROOT = None` and choose **Run All**. The four code cells get the
++latest code, set up data and dependencies, train, and show results.
++The notebook clones the current HEAD of `feat/task-frequency-state` automatically
++and prints the exact branch/commit used. It creates fresh checkout/output
++directories on each Run All, preserving earlier runs.
++
++CUB discovery searches recursively, including the LGSP layout
++`LGSP/CUB_200_2011/CUB_200_2011`. Even an explicit `DATA_ROOT` may point to an
++outer folder; the setup finds the nested folder with `images/` and all three
++official metadata files. It can attach the image dataset with kagglehub when no
++Input is attached. Missing or ambiguous official metadata produces a clear error;
++the official train/test split and its hashes are still checked.
 +
 +## Full training from images (default)
 +
-+`RUN_MODE = 'train_collect'` is the notebook default. Run all cells to start a
++The notebook always uses `train_collect`. Run all cells to start a
 +**new full 10 × 30 epoch run** using all 5,994 official training images across
 +200 classes. The 5,794 official test images remain evaluation-only.
 +It uses the pinned original training loop and optimizer grouping, with fresh LR
@@ -2188,9 +2308,12 @@ new file mode 100644
 +
 +## Protocol and implementation
 +
-+Pinned base: `80081081ab42769d102f83d447705da0639e2fb1` from
-+<https://github.com/thanhphu25/SEEP>. The notebook embeds a SHA256-verified patch
-+and clones this base; it does not require a pushed feature branch. Only the CUB
++Runtime source: the latest `feat/task-frequency-state` commit from
++<https://github.com/thanhphu25/SEEP>. There is no embedded source patch or checkout
++of an old commit in the notebook. `source_manifest.json` records the actual
++remote, branch and commit. The separate delivery patch against original base
++`80081081ab42769d102f83d447705da0639e2fb1` is retained for offline verification.
++Only the CUB
 +ImageFolder adapter, lazy video imports and `tools/prepare_cub200.py` were reused
 +from the supplied align-only ZIP. Original DGCA patch SHA256:
 +`ecec522a42518819d2504890b6c7b6fede6938c5aca7d5d47322c2cd6cc9996e`.
@@ -2221,13 +2344,14 @@ new file mode 100644
 +
 +## Outputs and interpretation
 +
-+Default output: `/kaggle/working/seep_frequency_state_seed3407`.
++Each run creates `/kaggle/working/seep_frequency_state_seed3407_<run-id>/`
++and prints its exact location.
 +`SEEP_FREQUENCY_STATE_CUB200_metrics.zip` contains four full-precision CSV
 +matrices, summaries, per-task initial/peak/final values, comparison deltas,
 +training/bank provenance, route counts, paired output diagnostics, mutation
 +checks, source/split/pretrained manifests, environment, configuration, timing,
 +logs, tests, patch, README and an output-free notebook. Model checkpoints are
-+saved separately in `/kaggle/working/seep_frequency_state_seed3407/checkpoint/`
++saved separately in `OUTPUT/checkpoint/`
 +by default. They are retained in the Kaggle notebook output and excluded from
 +the metrics ZIP.
 +
